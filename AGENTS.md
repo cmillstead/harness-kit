@@ -56,6 +56,9 @@ npm run lint:fix     # Auto-fix lint issues
 - NEVER claim work is done without running verification (tests, lint, typecheck)
 - NEVER retry the same failed approach more than 3 times — escalate instead
 
+## Code Style
+Read docs/code-style.md when: writing Python, TypeScript, Angular, JavaScript, HTML, or SCSS.
+
 ## Golden Principles
 Read docs/golden-principles.md when: making architectural decisions or resolving ambiguity.
 
