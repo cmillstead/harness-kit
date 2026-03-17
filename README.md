@@ -18,7 +18,8 @@ This creates:
 | `AGENTS.md` | Universal instruction file | Codex, Copilot, Claude, all |
 | `CLAUDE.md` | Thin wrapper for Claude Code | Claude |
 | `.cursor/rules/harness.md` | Thin wrapper for Cursor | Cursor |
-| `docs/golden-principles.md` | 10 decision-making principles | All |
+| `docs/golden-principles.md` | 16 operational rules for agents | All |
+| `docs/harness-philosophy.md` | 10 foundational principles (human reference) | — |
 | `.harness/hooks/no-mocks.sh` | Git hook: block mocks in tests | All (git-level) |
 | `.harness/hooks/pre-commit-verify.sh` | Git hook: require test/lint before commit | All (git-level) |
 | `.pre-commit-config.yaml` | Hook configuration | All |
