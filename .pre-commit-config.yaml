@@ -1,0 +1,29 @@
+# Universal harness pre-commit hooks.
+# Works with any AI agent or human developer.
+#
+# Install: pip install pre-commit && pre-commit install
+# Or use: ./install.sh (handles everything)
+
+repos:
+  - repo: local
+    hooks:
+      - id: no-mocks
+        name: Block mock usage in tests
+        entry: .harness/hooks/no-mocks.sh
+        language: script
+        stages: [pre-commit]
+        pass_filenames: false
+
+      - id: verify-before-commit
+        name: Verify tests/lint ran before commit
+        entry: .harness/hooks/pre-commit-verify.sh
+        language: script
+        stages: [pre-commit]
+        pass_filenames: false
+
+      - id: post-commit-cleanup
+        name: Clean up verification stamp
+        entry: .harness/hooks/post-commit-cleanup.sh
+        language: script
+        stages: [post-commit]
+        pass_filenames: false
