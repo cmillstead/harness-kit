@@ -28,7 +28,6 @@ NEVER claim work is complete without running verification commands. Evidence bef
 
 ## 8. Bounded Iteration
 If the same fix fails 3 times, STOP. Escalate to human with context: what you tried, what failed, what you think the problem is. Doom loops waste tokens, money, and context window.
-- **Enforcement**: loop detection hook tracks repeated failures
 
 ## 9. Ask Before High-Impact Changes
 Adding dependencies, modifying schemas, changing public APIs, deleting shared files — these affect the team and the project's long-term direction. Pause and confirm before proceeding.
@@ -53,3 +52,9 @@ When writing error handling, include what the caller should do about it. Not jus
 
 ## 16. Naming Is Architecture
 Consistent naming conventions across the codebase are load-bearing, not cosmetic. When iOS calls it `lastPurchaseDate` and Android calls it `last_purchase_date`, translation is easy. When one uses `fetchUserProfile` and the other uses `getUserData`, everything breaks. Inconsistent names produce inconsistent agent output. Align names before aligning code.
+
+## 17. Define Exceptions by Purpose, Not Format
+"Markdown docs are OK to edit directly" sounds clear — until the agent classifies your SKILL.md as a markdown doc. Define what's exempt by what it does (documentation), not what it is (.md file).
+
+## 18. The Thought "This Is Too Simple" Is the Signal to Use the Process
+Agents have a strong prior toward efficiency. When they see a trivial task, they invent reasons to skip the workflow. Name this tendency explicitly so the agent recognizes it as a compliance trigger, not a valid optimization.
