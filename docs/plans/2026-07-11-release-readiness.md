@@ -671,10 +671,12 @@ Run: `shellcheck hooks/pre-commit-verify.sh`
 Expected: no output, exit 0.
 Run: `grep -rn 'Golden Principle #8' hooks/`
 Expected: no output.
-Run: `grep -n 'CLAUDE_SESSION_ID\|tool_response' hooks/pre-completion-checklist.py`
-Expected: no output (no env session id, no `tool_response` inspection).
-Run: `grep -c 'CLAUDE_PROJECT_DIR' hooks/pre-completion-checklist.py`
-Expected: `1` (the single `CLAUDE_PROJECT_DIR` reference is the **bounded fallback**; the git top-level of the event `cwd` is resolved **first** — R4-1).
+Run: `grep -n 'CLAUDE_SESSION_ID' hooks/pre-completion-checklist.py`
+Expected: no output (no env session id anywhere).
+Run: `grep -n 'tool_response' hooks/pre-completion-checklist.py`
+Expected: exactly one match, in the module docstring (the line "…no exit-code/tool_response inspection is needed…") — the string must NOT appear in any code line (the docstring documents the design; the logic never inspects `tool_response`).
+Run: `grep -c 'os.environ.get("CLAUDE_PROJECT_DIR")' hooks/pre-completion-checklist.py`
+Expected: `1` (the single CODE reference is the **bounded fallback** in `project_root()`; the git top-level of the event `cwd` is resolved **first** — R4-1. The bare string `CLAUDE_PROJECT_DIR` also appears in the docstring and two comments, so a bare `grep -c 'CLAUDE_PROJECT_DIR'` returns 4 — that is expected and fine.)
 
 Behavioral verification (PostToolUse-only recording, anchored-validation negatives, session+project-root scoping, deny/allow, future+stale stamp) is covered by `tests/smoke.sh` (Task 11a).
 
