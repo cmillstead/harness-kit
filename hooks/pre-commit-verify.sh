@@ -67,7 +67,7 @@ if [ ! -f "$STAMP_FILE" ]; then
     echo "BLOCKED: No verification stamp found"
     echo "============================================"
     echo ""
-    echo "Golden Principle #8: Verify Before Claiming Done."
+    echo "Golden Principle #7: Verify Before Claiming Done."
     echo ""
     echo "Run tests and linting before committing:"
     echo "  npm test && npm run lint && touch $STAMP_FILE"
@@ -91,9 +91,26 @@ else
     stamp_time=$(stat -c %Y "$STAMP_FILE")
 fi
 now=$(date +%s)
-age=$(( (now - stamp_time) / 60 ))
+age_seconds=$(( now - stamp_time ))
 
-if [ "$age" -gt "$MAX_AGE_MINUTES" ]; then
+# Reject a future-dated stamp (clock skew, or a hand-set mtime) — a negative
+# age would otherwise slip past the stale check below.
+if [ "$age_seconds" -lt 0 ]; then
+    echo "============================================"
+    echo "BLOCKED: Verification stamp timestamp is in the future"
+    echo "============================================"
+    echo ""
+    echo "The stamp's timestamp is ahead of the current time (clock skew?)."
+    echo "Re-run tests and linting to create a fresh stamp:"
+    echo "  npm test && npm run lint && touch $STAMP_FILE"
+    echo ""
+    rm -f "$STAMP_FILE"
+    exit 1
+fi
+
+# Compare in SECONDS (truncated minutes would let a 30m59s stamp pass).
+if [ "$age_seconds" -gt "$(( MAX_AGE_MINUTES * 60 ))" ]; then
+    age=$(( age_seconds / 60 ))
     echo "============================================"
     echo "BLOCKED: Verification stamp is stale (${age}m old)"
     echo "============================================"
