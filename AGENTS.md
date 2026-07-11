@@ -26,6 +26,8 @@ npm run lint:fix     # Auto-fix lint issues
 - NEVER use default exports — use named exports only
 - Comments explain WHY, not WHAT
 
+Read docs/code-style.md when: writing Python, TypeScript, Angular, JavaScript, HTML, or SCSS.
+
 ## Testing
 - Use real implementations in tests — NEVER use mocks, patches, or stubs
 - The ONLY exception: external paid APIs with no sandbox (add `# mock-ok: <reason>`)
@@ -55,9 +57,32 @@ npm run lint:fix     # Auto-fix lint issues
 - NEVER introduce a new framework or library without explicit approval
 - NEVER claim work is done without running verification (tests, lint, typecheck)
 - NEVER retry the same failed approach more than 3 times — escalate instead
+- NEVER construct a reason why a particular edit "doesn't count" as a code change.
+  Updating test expectations, changing string literals, fixing typos, renaming variables —
+  these are ALL code changes. If you are building a rationale for why a specific edit is
+  exempt from a rule, that rationale is the signal to follow the rule.
+- NEVER edit agent configuration files directly just because they use a `.md` extension
+  (skill definitions, prompt templates, workflow specs). They are configuration, not
+  documentation — route changes through your normal process.
 
-## Code Style
-Read docs/code-style.md when: writing Python, TypeScript, Angular, JavaScript, HTML, or SCSS.
+## Orchestration Rules
+<!-- Applies only if this project uses agent teams or multi-agent workflows. Delete this section if it does not. -->
+
+If this project uses agent teams or multi-agent workflows:
+
+1. **Dispatch first, self-execute second.** When you have both delegatable work (agent tasks)
+   and self-executable work (memory saves, doc writes, context reads), dispatch agents FIRST,
+   then do your own tasks while agents run. Agent work takes longer — start it immediately.
+
+2. **One file, one audience.** This AGENTS.md is for the orchestrator. Worker-specific
+   instructions belong in reference files that workers load on demand. If you find yourself
+   writing instructions here that only apply to implementers or reviewers, move them to
+   the appropriate reference file.
+
+3. **Context inheritance.** Every agent that touches code receives docs/code-style.md.
+   Every agent that makes decisions receives docs/golden-principles.md. Every agent that
+   plans receives team memory. If you add a new reference file, update the dispatch
+   instructions for every agent that needs it.
 
 ## Golden Principles
 Read docs/golden-principles.md when: making architectural decisions or resolving ambiguity.
