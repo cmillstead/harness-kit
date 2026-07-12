@@ -250,21 +250,24 @@ rm -rf "$nm_js"
 
 # (FR2) enumeration failure: no-mocks must ABORT (nonzero exit + the
 # enumeration-failure message), not silently scan an empty list, when its own
-# `git diff --cached --name-only` call fails. GIT_CEILING_DIRECTORIES pins repo
-# discovery to stop at this bare (never `git init`'d) fixture dir, so it does
-# NOT fall through to $WORK's own outer repo the way every other bare `mktemp -d`
-# fixture in this file benefits from (nested discovery finds the nearest .git) —
-# here that fallback is exactly what we must defeat to force the enumeration
-# call itself to fail.
+# `git diff --cached --name-only` call fails. We force that failure by pointing
+# GIT_DIR at a real directory that is NOT a git repository: setting GIT_DIR
+# disables git's upward repo *discovery* entirely, so the enumeration call fails
+# deterministically on every platform. (An earlier GIT_CEILING_DIRECTORIES +
+# bare-dir approach relied on discovery failing, which is environment-specific:
+# on some Linux CI runners git still discovered an ancestor repo above /tmp,
+# enumerated zero files, and exited 0 — the injection never fired. GIT_DIR
+# removes that dependence on the surrounding filesystem.)
 nm_noenum="$(mktemp -d)"
-nm_noenum_out="$(cd "$nm_noenum" && GIT_CEILING_DIRECTORIES="$nm_noenum" bash "$HARNESS_KIT/hooks/no-mocks.sh" 2>&1)"
+nm_noenum_gitdir="$(mktemp -d)"   # exists, but is not a git repository
+nm_noenum_out="$(cd "$nm_noenum" && GIT_DIR="$nm_noenum_gitdir" bash "$HARNESS_KIT/hooks/no-mocks.sh" 2>&1)"
 nm_noenum_rc=$?
 if [ "$nm_noenum_rc" -ne 0 ] && printf '%s' "$nm_noenum_out" | grep -q "failed to enumerate staged files"; then
     ok "no-mocks: staged-file enumeration failure aborts (nonzero exit + message), not a silent no-op"
 else
     bad "no-mocks: enumeration failure not handled (rc=$nm_noenum_rc)"
 fi
-rm -rf "$nm_noenum"
+rm -rf "$nm_noenum" "$nm_noenum_gitdir"
 
 # --- Test B: missing stamp blocks when a project marker exists ---
 printf '{"name":"demo"}\n' > package.json
