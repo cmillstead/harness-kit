@@ -163,6 +163,67 @@ else
     bad "idempotency: second install did not exit 0"
 fi
 
+# --- CLAUDE.md pre-existing message-only behavior (installer step 6). Each
+#     fixture is a standalone sandbox repo (mktemp -d + git init), not $WORK, so
+#     it does not disturb the completeness/idempotency state above. ---
+
+# Assertion 1: a pre-existing CLAUDE.md WITHOUT an AGENTS.md reference is
+# preserved byte-for-byte (message-only: never mutate authored content), and the
+# installer prints the actionable AGENTS.md pointer line plus the nudge to add it.
+cm_noref="$(mktemp -d)"
+(
+    cd "$cm_noref" || exit 1
+    git init -q && git config user.email a@b.c && git config user.name t
+    printf '# My rules\ndo the thing\n' > CLAUDE.md
+)
+cp "$cm_noref/CLAUDE.md" "$cm_noref/.claude.orig"
+cm_noref_out="$(cd "$cm_noref" && HARNESS_KIT_HOOK_MODE=direct bash "$HARNESS_KIT/install.sh" 2>&1)"
+cm_noref_rc=$?
+if [ "$cm_noref_rc" -eq 0 ] && cmp -s "$cm_noref/CLAUDE.md" "$cm_noref/.claude.orig" \
+   && printf '%s' "$cm_noref_out" | grep -qF "Read AGENTS.md for project conventions" \
+   && printf '%s' "$cm_noref_out" | grep -q "add this line"; then
+    ok "CLAUDE.md: pre-existing file without an AGENTS.md ref preserved byte-for-byte; pointer nudge printed"
+else
+    bad "CLAUDE.md: no-ref case failed (rc=$cm_noref_rc)"
+fi
+rm -rf "$cm_noref"
+
+# Assertion 2: a pre-existing CLAUDE.md WITH an AGENTS.md reference is preserved
+# byte-for-byte, the installer reports the idempotent skip message, and does NOT
+# print the nag to add the pointer line.
+cm_ref="$(mktemp -d)"
+(
+    cd "$cm_ref" || exit 1
+    git init -q && git config user.email a@b.c && git config user.name t
+    printf '# My CLAUDE.md\nRead AGENTS.md for project conventions, boundaries, and commands.\n' > CLAUDE.md
+)
+cp "$cm_ref/CLAUDE.md" "$cm_ref/.claude.orig"
+cm_ref_out="$(cd "$cm_ref" && HARNESS_KIT_HOOK_MODE=direct bash "$HARNESS_KIT/install.sh" 2>&1)"
+cm_ref_rc=$?
+if [ "$cm_ref_rc" -eq 0 ] && cmp -s "$cm_ref/CLAUDE.md" "$cm_ref/.claude.orig" \
+   && printf '%s' "$cm_ref_out" | grep -q "references AGENTS.md" \
+   && ! printf '%s' "$cm_ref_out" | grep -q "add this line"; then
+    ok "CLAUDE.md: pre-existing file with an AGENTS.md ref preserved byte-for-byte; skip message printed, no nag"
+else
+    bad "CLAUDE.md: with-ref case failed (rc=$cm_ref_rc)"
+fi
+rm -rf "$cm_ref"
+
+# Assertion 3: no pre-existing CLAUDE.md -> created with the AGENTS.md pointer
+# line. The completeness check above only asserts file EXISTENCE; this asserts
+# CONTENT, which is the create-path behavior this task's fix must not disturb.
+cm_new="$(mktemp -d)"
+( cd "$cm_new" && git init -q && git config user.email a@b.c && git config user.name t )
+( cd "$cm_new" && HARNESS_KIT_HOOK_MODE=direct bash "$HARNESS_KIT/install.sh" ) >/dev/null 2>&1
+cm_new_rc=$?
+if [ "$cm_new_rc" -eq 0 ] && [ -f "$cm_new/CLAUDE.md" ] \
+   && grep -qF "Read AGENTS.md for project conventions" "$cm_new/CLAUDE.md"; then
+    ok "CLAUDE.md: no pre-existing file -> created with the AGENTS.md pointer line"
+else
+    bad "CLAUDE.md: create path missing the AGENTS.md pointer line (rc=$cm_new_rc)"
+fi
+rm -rf "$cm_new"
+
 # Baseline commit (no marker -> docs-only; --no-verify keeps setup hook-independent).
 git add -A
 run_or_die "baseline commit" git commit -q --no-verify -m "chore: install harness"

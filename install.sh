@@ -13,7 +13,7 @@
 #   4.  Creates .pre-commit-config.yaml (or flags a pre-existing foreign one)
 #   -   Wires git hooks (pre-commit framework, or raw .git/hooks, per HOOK_MODE)
 #   5.  Adds .harness-verified to .gitignore
-#   6.  Creates thin CLAUDE.md wrapper (if not present)
+#   6.  Creates thin CLAUDE.md wrapper (if absent); if present, warns + prints the AGENTS.md pointer line to add
 #   7.  Creates thin .cursor/rules/harness.md wrapper (if not present)
 #   8.  Copies reference templates: decision-record, eval, escape-hatch, context-inheritance
 #   9.  Copies skills/review.md
@@ -469,6 +469,12 @@ Read docs/golden-principles.md when: making architectural decisions or resolving
 - If you use a code-navigation MCP server, prefer it over reading whole files
 EOF
     echo "✓ Created CLAUDE.md (thin wrapper pointing to AGENTS.md)"
+elif grep -qF "AGENTS.md" CLAUDE.md; then
+    echo "⟳ CLAUDE.md already exists and references AGENTS.md — skipping"
+else
+    echo "⟳ CLAUDE.md already exists — skipping (not overwriting your file)"
+    echo "  → add this line so Claude loads the harness conventions:"
+    echo "      Read AGENTS.md for project conventions, boundaries, and commands."
 fi
 
 # 7. Thin Cursor rules wrapper
