@@ -32,7 +32,16 @@ cd "${CLAUDE_PROJECT_DIR:-.}" || exit 0
 # state-dir discipline (R3-7): lstat must show a real, non-symlink, self-owned
 # 0700 dir, else no counter is used (COUNTER stays empty and Guard 2 is skipped).
 # The python block NEVER raises (R4-5): even if the state dir cannot be created it
-# still prints the stop_hook_active flag, so Guard 1 is never lost.
+# still prints the stop_hook_active flag, so Guard 1 is never lost. Non-dict
+# top-level JSON (e.g. `[]`, `42`, `null`) is coerced to `{}` before any
+# `.get()` call so it can never raise AttributeError.
+# The two output lines are read POSITION-addressed (sed -n 1p / 2p), not via
+# head/tail — `$()` strips ALL trailing newlines, so an empty second line
+# (empty COUNTER) would otherwise collapse into the first line and corrupt
+# STOP_ACTIVE. COUNTER is further validated bash-side as an absolute path
+# with a "stop-"-prefixed basename before use. If python fails entirely (missing/killed,
+# so `parsed` itself is empty) we WARN and allow the stop rather than risk an
+# unbounded block loop with no working loop guards.
 INPUT="$(cat)"
 parsed="$(printf '%s' "$INPUT" | python3 -c '
 import hashlib, json, os, stat, sys, tempfile
@@ -40,6 +49,8 @@ import hashlib, json, os, stat, sys, tempfile
 try:
     data = json.load(sys.stdin)
 except json.JSONDecodeError:
+    data = {}
+if not isinstance(data, dict):
     data = {}
 
 active = "1" if data.get("stop_hook_active") is True else "0"
@@ -96,21 +107,51 @@ if state:
 print(active)
 print(counter)
 ')"
-STOP_ACTIVE="$(printf '%s\n' "$parsed" | head -n 1)"
-COUNTER="$(printf '%s\n' "$parsed" | tail -n 1)"
+if [ -z "$parsed" ]; then
+  echo "WARNING: stop-verify could not parse hook input; allowing stop (loop guards unavailable)." >&2
+  exit 0
+fi
+STOP_ACTIVE="$(printf '%s\n' "$parsed" | sed -n 1p)"
+COUNTER="$(printf '%s\n' "$parsed" | sed -n 2p)"
 [ -n "$STOP_ACTIVE" ] || STOP_ACTIVE=0
+case "$COUNTER" in
+  /*/stop-*) ;;      # absolute path, stop- prefixed basename — keep
+  *) COUNTER="" ;;   # anything else (relative, empty, junk) — Guard 2 skipped
+esac
 
 # Detect project type; only set a command that actually exists (Codex 9, S5, S6).
 TEST_CMD=""
 LINT_CMD=""
 TYPE_CMD=""
+PKG_MALFORMED=0
 if [ -f "package.json" ]; then
-  # Read package.json scripts structurally (S5), not by grepping the raw file.
-  if python3 -c 'import json,sys; sys.exit(0 if "test" in (json.load(open("package.json")).get("scripts") or {}) else 1)' 2>/dev/null; then
-    TEST_CMD="npm test"
-  fi
-  if python3 -c 'import json,sys; sys.exit(0 if "lint" in (json.load(open("package.json")).get("scripts") or {}) else 1)' 2>/dev/null; then
-    LINT_CMD="npm run lint"
+  # Read package.json scripts structurally (S5), not by grepping the raw file,
+  # in ONE python3 invocation. Malformed/non-object JSON is distinguished from
+  # "no scripts" (Codex 7) so a broken package.json fails the check instead of
+  # silently disabling verification.
+  pkg_probe="$(python3 -c '
+import json, sys
+
+try:
+    data = json.load(open("package.json"))
+except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+    print("MALFORMED")
+    sys.exit(0)
+if not isinstance(data, dict):
+    print("MALFORMED")
+    sys.exit(0)
+
+scripts = data.get("scripts")
+if not isinstance(scripts, dict):
+    scripts = {}
+print("test" if "test" in scripts else "")
+print("lint" if "lint" in scripts else "")
+' 2>/dev/null)"
+  if [ "$(printf '%s\n' "$pkg_probe" | sed -n 1p)" = "MALFORMED" ]; then
+    PKG_MALFORMED=1
+  else
+    [ "$(printf '%s\n' "$pkg_probe" | sed -n 1p)" = "test" ] && TEST_CMD="npm test"
+    [ "$(printf '%s\n' "$pkg_probe" | sed -n 2p)" = "lint" ] && LINT_CMD="npm run lint"
   fi
   # Only typecheck with the project's own tsc (S6 — no deprecated npx flag,
   # no network install).
@@ -136,6 +177,11 @@ else
 fi
 
 FAILED=0
+if [ "$PKG_MALFORMED" -eq 1 ]; then
+  echo "BLOCK: package.json is malformed (cannot verify test/lint scripts). Fix it before completing." >&2
+  FAILED=1
+fi
+
 run_check() {
   local label="$1" cmd="$2" out
   [ -n "$cmd" ] || return 0
