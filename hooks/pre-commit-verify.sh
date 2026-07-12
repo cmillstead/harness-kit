@@ -9,8 +9,6 @@
 #   npm test && touch .harness-verified
 #   npm run lint && touch .harness-verified
 #
-# Or use the harness wrapper: harness-run <command>
-#
 # Skip with: git commit --no-verify (explicitly opted out)
 
 set -euo pipefail
