@@ -5,13 +5,20 @@
 #   cd /path/to/your/project
 #   ~/src/harness-kit/install.sh
 #
-# What it does:
-#   1. Copies AGENTS.md (if not present) or warns if one exists
-#   2. Copies docs/golden-principles.md
-#   3. Sets up git hooks (.harness/hooks/ + .pre-commit-config.yaml)
-#   4. Adds .harness-verified to .gitignore
-#   5. Creates thin CLAUDE.md wrapper (if not present)
-#   6. Creates thin .cursor/rules/harness.md wrapper (if not present)
+# What it does (numbered to match the sections in the body below):
+#   1.  Copies AGENTS.md (if not present) or warns if one exists
+#   2.  Copies docs/golden-principles.md
+#   2b. Copies docs/harness-philosophy.md + docs/code-style.md
+#   3.  Copies the git hook scripts into .harness/hooks/
+#   4.  Creates .pre-commit-config.yaml (or flags a pre-existing foreign one)
+#   -   Wires git hooks (pre-commit framework, or raw .git/hooks, per HOOK_MODE)
+#   5.  Adds .harness-verified to .gitignore
+#   6.  Creates thin CLAUDE.md wrapper (if not present)
+#   7.  Creates thin .cursor/rules/harness.md wrapper (if not present)
+#   8.  Copies reference templates: decision-record, eval, escape-hatch, context-inheritance
+#   9.  Copies skills/review.md
+#   9b. Creates .claude/skills/review/SKILL.md (frontmatter + the review body)
+#   10. Copies .claude/hooks/ (stop-verify.sh + pre-completion-checklist.py + settings-snippet.json)
 
 set -euo pipefail
 
@@ -31,6 +38,44 @@ if [ ! "$TOPLEVEL" -ef "$PROJECT_ROOT" ]; then
     echo "ERROR: Run install.sh from the repository root: $TOPLEVEL"
     exit 1
 fi
+
+# python3 is a hard dependency (path canonicalization below + worktree detection).
+# Under `set -e` a missing python3 would otherwise die mid-run with a bare "command
+# not found" AFTER some files were copied; fail fast with a clear message first.
+command -v python3 >/dev/null 2>&1 || { echo "ERROR: install.sh requires python3 (used for path canonicalization and worktree detection). Install python3 and re-run." >&2; exit 1; }
+
+# _realpath: canonical absolute path (resolves symlinks in the existing prefix).
+# Defined at the top so the containment guards below AND the hook-path checks later
+# both use it. Needs only python3 (verified above).
+_realpath() { python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+
+# Canonical project root for the symlink-escape containment guard.
+PROJECT_REAL="$(_realpath "$PROJECT_ROOT")"
+
+assert_contained() {
+    # Refuse a destination whose canonical path escapes the project root
+    # (e.g. via a symlinked ancestor). realpath resolves symlinks in the
+    # existing prefix, so a symlinked ancestor is caught before any write.
+    local path="$1" real
+    real="$(_realpath "$path")"
+    case "$real/" in
+        "$PROJECT_REAL"/*) return 0 ;;
+        *) echo "ERROR: $path resolves outside the project root: $real" >&2
+           echo "       A symlinked directory would place harness files outside your repo. Refusing." >&2
+           exit 1 ;;
+    esac
+}
+
+refuse_symlink_leaf() {
+    # Leaf companion to assert_contained (which guards ancestor dirs). A pre-existing
+    # symlink leaf could follow out of the repo; a symlink to a nonexistent target
+    # even passes `[ -f ]` as false and would be written THROUGH. Refuse it. Fatal.
+    local dest="$1"
+    if [ -L "$dest" ]; then
+        echo "ERROR: $dest is a symlink. Refusing to write through it (it may escape the repo)." >&2
+        exit 1
+    fi
+}
 
 # Internal/testing seam (R2-R5): force the hook-install path deterministically.
 #   direct    = raw git hooks even if the pre-commit framework is installed
@@ -66,6 +111,7 @@ if [ -n "$_gd_raw" ] && [ -n "$_gc_raw" ]; then
 fi
 
 # 1. AGENTS.md
+refuse_symlink_leaf AGENTS.md
 if [ -f AGENTS.md ]; then
     echo "⟳ AGENTS.md already exists — skipping (review manually)"
 else
@@ -74,6 +120,7 @@ else
 fi
 
 # 2. Golden Principles
+assert_contained docs
 mkdir -p docs
 if [ -f docs/golden-principles.md ]; then
     echo "⟳ docs/golden-principles.md already exists — skipping"
@@ -93,8 +140,10 @@ for doc in harness-philosophy.md code-style.md; do
 done
 
 # 3. Git hooks
+assert_contained .harness/hooks
 mkdir -p .harness/hooks
 for hook in no-mocks.sh pre-commit-verify.sh post-commit-cleanup.sh; do
+    refuse_symlink_leaf ".harness/hooks/$hook"
     if [ -f ".harness/hooks/$hook" ]; then
         echo "⟳ .harness/hooks/$hook already exists — skipping (delete it to re-install a fresh copy)"
     else
@@ -112,6 +161,7 @@ done
 # has no false "active"; a user who intentionally merged our hooks into their own
 # config keeps it (we do not overwrite) and just wires it up manually.
 CONFIG_FOREIGN=false
+refuse_symlink_leaf .pre-commit-config.yaml
 if [ -f .pre-commit-config.yaml ]; then
     if cmp -s .pre-commit-config.yaml "$HARNESS_KIT/.pre-commit-config.yaml"; then
         echo "⟳ .pre-commit-config.yaml is the harness config (byte-identical) — skipping"
@@ -123,11 +173,6 @@ else
     cp "$HARNESS_KIT/.pre-commit-config.yaml" .pre-commit-config.yaml
     echo "✓ Created .pre-commit-config.yaml"
 fi
-
-# install_raw_git_hooks: wire raw git hooks, chaining any existing (foreign) hook.
-# Sets HOOKS_ACTIVE=true on success. Honors core.hooksPath but REFUSES to write
-# outside the repo (R3).
-_realpath() { python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
 
 # preflight_raw_hook: validate a target hook WITHOUT mutating anything (R3-2).
 # Refuses a symlink target or a preserved-name collision. Returns non-zero to
@@ -165,7 +210,9 @@ _snap_one() {
     local src="$1" dst="$2"
     if [ -e "$src" ] || [ -L "$src" ]; then
         cp -p "$src" "$dst" || return 1          # -p preserves mode+timestamps (POSIX)
-        : > "$dst.exists"
+        : > "$dst.exists" || return 1            # an unchecked marker write would make
+                                                 # rollback treat a saved hook as ABSENT
+                                                 # and DELETE the original — fail instead.
     fi
     return 0
 }
@@ -202,16 +249,22 @@ _restore_hook() {
 
 # _apply_raw_hook: mutate ONE hook (snapshot + preflight must have passed). Chains a
 # foreign hook by renaming it to <hook>.harness-preserved, writes our marked wrapper,
-# and chmods it. A marker-owned but NON-executable hook (a prior half-install) is
-# repaired with chmod INSIDE the transaction, so it is rolled back cleanly if the
-# OTHER hook later fails. Every mutating step is checked (this runs left of `||`,
-# where `set -e` is suspended). Returns non-zero on any failure; the caller rolls back.
+# and chmods it. A marker-owned hook is NOT trusted by its body: it is re-materialized
+# byte-for-byte with the current $body (a planted marker-only/no-op body or a prior
+# half-install is thus overwritten, not merely chmod'd), then made executable — all
+# INSIDE the transaction, so it is rolled back cleanly if the OTHER hook later fails.
+# Every mutating step is checked (this runs left of `||`, where `set -e` is suspended).
+# Returns non-zero on any failure; the caller rolls back.
 _apply_raw_hook() {
     local name="$1" body="$2"
     local target="$HOOKS_DIR/$name"
     local preserved="$target.harness-preserved"
     if grep -Fxq '# harness-kit hook' "$target" 2>/dev/null; then
-        # Already our wrapper (idempotent re-run) — ensure it is executable (R5-2).
+        # Marker-owned: do NOT trust the existing body. Re-materialize it with the
+        # current $body when it differs (idempotent when identical), then ensure +x.
+        if ! printf '%s\n' "$body" | cmp -s - "$target"; then
+            printf '%s\n' "$body" > "$target" || return 1
+        fi
         chmod +x "$target" || return 1
         return 0
     fi
@@ -302,14 +355,17 @@ fi
 }
 
 # install_precommit_framework: wire hooks via the pre-commit framework.
-# Sets HOOKS_ACTIVE=true on success; returns 1 if pre-commit is missing OR if
-# either install step fails (R3-1 — a failed install must not report success).
+# Sets HOOKS_ACTIVE=true on success (R3-1 — a failed install must not report success).
+# Distinguishes two failures so the caller can react differently:
+#   return 1 = pre-commit is ABSENT (auto mode may fall back to raw hooks)
+#   return 2 = pre-commit is present but a wiring STEP FAILED (do NOT fall back to raw
+#              hooks — that would double-wire the framework's just-installed pre-commit)
 install_precommit_framework() {
     if ! command -v pre-commit &> /dev/null; then
         return 1
     fi
-    pre-commit install || return 1
-    pre-commit install --hook-type post-commit || return 1
+    pre-commit install || return 2
+    pre-commit install --hook-type post-commit || return 2
     echo "✓ Installed pre-commit hooks"
     HOOKS_ACTIVE=true
 }
@@ -341,7 +397,16 @@ elif [ "$CONFIG_FOREIGN" = true ] && [ "$HOOK_MODE" = auto ]; then
     echo "     pre-commit install && pre-commit install --hook-type post-commit"
     echo "  Until merged, no-mocks and verify checks will NOT run."
 elif [ "$HOOK_MODE" = precommit ]; then
-    if ! install_precommit_framework; then
+    if install_precommit_framework; then
+        rc=0
+    else
+        rc=$?
+    fi
+    if [ "$rc" -eq 2 ]; then
+        echo "ERROR: HARNESS_KIT_HOOK_MODE=precommit but wiring the pre-commit"
+        echo "       framework failed. Fix pre-commit and re-run."
+        exit 1
+    elif [ "$rc" -ne 0 ]; then
         echo "ERROR: HARNESS_KIT_HOOK_MODE=precommit but the pre-commit framework"
         echo "       is not installed. Install it (pipx install pre-commit) and re-run."
         exit 1
@@ -349,23 +414,46 @@ elif [ "$HOOK_MODE" = precommit ]; then
 elif [ "$HOOK_MODE" = direct ]; then
     echo "Installing raw git hooks (HARNESS_KIT_HOOK_MODE=direct)"
     install_raw_git_hooks || exit 1   # explicit direct mode: a refusal is fatal (R3-2)
-elif install_precommit_framework; then
-    :   # auto: framework present and used
 else
-    echo "pre-commit not found — installing raw git hooks"
-    install_raw_git_hooks || true     # auto fallback: a refusal leaves hooks inactive
+    # auto mode, no foreign config: prefer the framework, fall back to raw hooks only
+    # when pre-commit is ABSENT (rc=1). A wiring failure (rc=2) is fatal — falling back
+    # to raw hooks would chain the framework's just-installed pre-commit and run the
+    # harness checks twice. Capture rc via `if` so `set -e` does not exit first.
+    if install_precommit_framework; then
+        rc=0
+    else
+        rc=$?
+    fi
+    if [ "$rc" -eq 0 ]; then
+        :   # framework present and used
+    elif [ "$rc" -eq 2 ]; then
+        echo "ERROR: the pre-commit framework is installed but wiring it failed." >&2
+        echo "       Not falling back to raw hooks (that would double-wire). Fix pre-commit and re-run." >&2
+        exit 1
+    else
+        echo "pre-commit not found — installing raw git hooks"
+        install_raw_git_hooks || true     # auto fallback: a refusal leaves hooks inactive
+    fi
 fi
 
 # 5. Gitignore additions
+refuse_symlink_leaf .gitignore
 IGNORE_ENTRIES=(".harness-verified")
 for entry in "${IGNORE_ENTRIES[@]}"; do
     if ! grep -qF "$entry" .gitignore 2>/dev/null; then
+        # If the file lacks a trailing newline, a bare append would merge our entry
+        # onto the user's last pattern (corrupting it AND leaving the stamp untracked).
+        # tail -c1 is empty ONLY when the last byte already IS a newline.
+        if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then
+            printf '\n' >> .gitignore
+        fi
         echo "$entry" >> .gitignore
         echo "✓ Added $entry to .gitignore"
     fi
 done
 
 # 6. Thin CLAUDE.md wrapper (Claude Code)
+refuse_symlink_leaf CLAUDE.md
 if [ ! -f CLAUDE.md ]; then
     cat > CLAUDE.md << 'EOF'
 # CLAUDE.md
@@ -382,7 +470,9 @@ EOF
 fi
 
 # 7. Thin Cursor rules wrapper
+assert_contained .cursor/rules
 mkdir -p .cursor/rules
+refuse_symlink_leaf .cursor/rules/harness.md
 if [ -f .cursor/rules/harness.md ]; then
     echo "⟳ .cursor/rules/harness.md already exists — skipping"
 else
@@ -411,7 +501,9 @@ for doc in decision-record-template.md eval-template.md escape-hatch-audit.md co
 done
 
 # 9. Structural review skill (portable copy for any agent)
+assert_contained skills
 mkdir -p skills
+refuse_symlink_leaf skills/review.md
 if [ -f skills/review.md ]; then
     echo "⟳ skills/review.md already exists — skipping"
 else
@@ -420,7 +512,9 @@ else
 fi
 
 # 9b. Claude Code skill form: frontmatter + the verbatim review skill body
+assert_contained .claude/skills/review
 mkdir -p .claude/skills/review
+refuse_symlink_leaf .claude/skills/review/SKILL.md
 if [ -f .claude/skills/review/SKILL.md ]; then
     echo "⟳ .claude/skills/review/SKILL.md already exists — skipping"
 else
@@ -435,8 +529,10 @@ else
 fi
 
 # 10. Claude Code dynamic hooks (inert until wired into .claude/settings.json)
+assert_contained .claude/hooks
 mkdir -p .claude/hooks
 for hook in stop-verify.sh pre-completion-checklist.py settings-snippet.json; do
+    refuse_symlink_leaf ".claude/hooks/$hook"
     if [ -f ".claude/hooks/$hook" ]; then
         echo "⟳ .claude/hooks/$hook already exists — skipping"
     else
