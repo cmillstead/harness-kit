@@ -660,6 +660,34 @@ else
     bad "FR3: 'cd notes' inside a quoted message was wrongly denied (rc=$GATE_RC, out=$GATE_OUT)"
 fi
 
+# --- Right-sized gate regression (a4e8a4e): the raw-text regex still catches
+#     wrapper-prefixed commit invocations (missing-evidence deny, no evidence
+#     recorded for either session), while a `commit` appearing only as a FLAG
+#     VALUE (not the subcommand) is not over-detected as a commit at all. ---
+wrap_env_sess="smoke-$$-${RANDOM}-wrap-env"
+run_gate_cmd "$wrap_env_sess" "$WORK" "$WORK" "env git commit -m x"
+if [ "$GATE_RC" -eq 0 ] && printf '%s' "$GATE_OUT" | grep -q "PRE-COMPLETION CHECKLIST"; then
+    ok "regression: 'env git commit -m x' wrapper prefix detected as a commit (missing-evidence deny)"
+else
+    bad "regression: 'env git commit -m x' not detected as a commit (rc=$GATE_RC)"
+fi
+
+wrap_bashc_sess="smoke-$$-${RANDOM}-wrap-bashc"
+run_gate_quoted "$wrap_bashc_sess" "$WORK" "$WORK" 'bash -c "git commit"'
+if [ "$GATE_RC" -eq 0 ] && printf '%s' "$GATE_OUT" | grep -q "PRE-COMPLETION CHECKLIST"; then
+    ok 'regression: bash -c "git commit" wrapper detected as a commit (missing-evidence deny)'
+else
+    bad "regression: bash -c \"git commit\" not detected as a commit (rc=$GATE_RC)"
+fi
+
+grep_commit_sess="smoke-$$-${RANDOM}-grep-commit"
+run_gate_cmd "$grep_commit_sess" "$WORK" "$WORK" "git log --grep=commit"
+if [ "$GATE_RC" -eq 0 ] && [ -z "$GATE_OUT" ]; then
+    ok "regression: 'git log --grep=commit' is not over-detected as a commit (gate silent)"
+else
+    bad "regression: 'git log --grep=commit' wrongly gated (rc=$GATE_RC, out=$GATE_OUT)"
+fi
+
 # --- FX4: malformed gate event. A PreToolUse Bash event with `tool_input: null`
 #     (identifiably a commit-gate evaluation but unparseable) must emit an EXPLICIT
 #     deny (fail-closed) and never raise a traceback.
