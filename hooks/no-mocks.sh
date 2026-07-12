@@ -36,6 +36,17 @@ TEST_PATTERNS='test[s]?[/_]|_test\.|\.test\.|\.spec\.|test_'
 
 violations=()
 
+# Enumerate staged files into a checked temp file. A process substitution
+# here would silently swallow a git failure under set -euo pipefail and the
+# loop would just see empty input, scanning nothing while exiting 0.
+staged_list="$(mktemp "${TMPDIR:-/tmp}/no-mocks-staged.XXXXXX")"
+trap 'rm -f "$staged_list"' EXIT
+
+if ! git diff --cached --name-only --diff-filter=ACMR -z > "$staged_list"; then
+    echo "no-mocks: failed to enumerate staged files" >&2
+    exit 1
+fi
+
 # Check only staged files
 while IFS= read -r -d '' file; do
     # Skip non-test files
@@ -49,18 +60,29 @@ while IFS= read -r -d '' file; do
     }
 
     for pattern in "${MOCK_PATTERNS[@]}"; do
-        # Find matches, exclude lines with mock-ok
+        # Find matches, exclude lines with mock-ok. Distinguish "no match"
+        # (grep rc 1, tolerated — this includes an earlier grep in the chain
+        # filtering everything out) from a genuine grep error (rc > 1) so an
+        # error can't be mistaken for a clean pass.
+        set +e
         matches=$(printf '%s\n' "$diff_out" \
             | grep -E '^\+' \
             | grep -v '^+++' \
             | grep -v 'mock-ok:' \
-            | grep -E "$pattern" || true)
+            | grep -E "$pattern")
+        grep_rc=$?
+        set -e
+
+        if [ "$grep_rc" -gt 1 ]; then
+            echo "no-mocks: grep failed (rc=$grep_rc) scanning $file for $pattern" >&2
+            exit 1
+        fi
 
         if [ -n "$matches" ]; then
             violations+=("$file: $pattern")
         fi
     done
-done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+done < "$staged_list"
 
 if [ ${#violations[@]} -gt 0 ]; then
     echo "============================================"
