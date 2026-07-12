@@ -5,7 +5,10 @@ One script, two Claude Code events (selected via hook_event_name in stdin):
 
   PreToolUse  (matcher: Bash) — GATE only. Before `git commit`/`git push`,
               deny if this session has not recorded BOTH a test and a lint
-              run for this working directory. Never records anything.
+              run for this working directory. Also denies a commit whose
+              effective target could be a DIFFERENT repo than this event's
+              (a chained `cd`, or `-C`/`--git-dir`/`--work-tree`) before ever
+              consulting recorded evidence. Never records anything.
   PostToolUse (matcher: Bash) — RECORD only. PostToolUse fires ONLY after a
               tool call SUCCEEDS (PostToolUseFailure fires on failure and is
               NOT registered), so the event itself is the success signal — no
@@ -15,8 +18,19 @@ One script, two Claude Code events (selected via hook_event_name in stdin):
 
 Anchored validation: reject any command containing || ; | & $( ` or a newline;
 split the rest on && and require EVERY segment to match an approved verification
-command anchored at its start. There is deliberately no leading-`cd` allowance:
-`cd other-repo && npm test` would run tests elsewhere yet authorize this repo.
+command anchored at its start (the approved-command allowlist requires the
+matched name be followed by whitespace or end-of-segment, so `make test-noop`
+is rejected — it must not be accepted as `make test`). There is deliberately
+no leading-`cd` allowance: `cd other-repo && npm test` would run tests
+elsewhere yet authorize this repo.
+
+Malformed events: the envelope (event is a dict; tool_input is a dict;
+tool_input.command is a str) is validated before any dict access, so a
+top-level `[]` or a `tool_input: null` can never crash this hook or slip
+through as a silent ALLOW. RECORD fails silently on malformed input; GATE
+fails CLOSED (explicit deny) whenever the malformed event is identifiably a
+Bash tool call at the gate, since we cannot then rule out that the
+unparseable command was a commit.
 
 State: a per-user 0700 dir under the system temp dir (validated via lstat; if it
 is not a private self-owned dir, or cannot be created, the hook FAILS CLOSED).
@@ -42,12 +56,20 @@ RECENT_SECONDS = 1800         # the gate looks back 30 minutes
 # Approved verification commands, anchored at a segment start (args allowed).
 # Kept in sync with the Stop hook's command set: pytest via `python3 -m pytest`,
 # `flake8`, `cargo check`, and the project-local `./node_modules/.bin/tsc`.
+# R-fix1 (Codex 9): the trailing anchor is `(?=\s|$)`, NOT `\b`. A bare `\b`
+# is satisfied by ANY non-word character following the command name, so
+# `make test-noop` (word `test` -> non-word `-`) wrongly matched `make test`,
+# letting a no-op target record real test/lint evidence. `(?=\s|$)` requires
+# the approved command to be followed by whitespace-then-arguments or by the
+# end of the segment, so `make test-noop` no longer matches `make test`
+# while `make test -j4` still does. Applies uniformly: every alternative
+# shares this single trailing anchor.
 APPROVED_RE = re.compile(
     r"^(npm test|npm run test|npm run lint|npx jest|npx vitest|npx eslint|"
     r"pytest|python3 -m pytest|ruff check|flake8|mypy|"
     r"cargo test|cargo clippy|cargo check|go test|"
     r"make test|make lint|make check|shellcheck|"
-    r"tsc --noEmit|\./node_modules/\.bin/tsc|bash -n)\b"
+    r"tsc --noEmit|\./node_modules/\.bin/tsc|bash -n)(?=\s|$)"
 )
 TEST_RE = re.compile(
     r"\b(npm test|npm run test|npx jest|npx vitest|pytest|cargo test|"
@@ -61,6 +83,16 @@ LINT_RE = re.compile(
 # options (`git -C . commit`, `git -c k=v push`). Over-matching only widens the
 # gate, which is the safe direction (R3-3).
 COMMIT_PATTERN = re.compile(r"\bgit\b(?:\s+-\S+(?:\s+\S+)?)*\s+(?:commit|push)\b")
+
+# R-fix3 (Codex 8): same shape as COMMIT_PATTERN, but the option run before
+# commit/push is captured so we can inspect it for a repo-retargeting flag.
+_GIT_COMMIT_OPTIONS_RE = re.compile(
+    r"\bgit\b((?:\s+-\S+(?:\s+\S+)?)*)\s+(?:commit|push)\b"
+)
+# A `cd` chained onto the same command line (via &&, ;, or |) can move the
+# shell into a different repo before the commit runs, even though the event's
+# cwd (and thus the recorded evidence) never changed.
+_CHAINED_CD_RE = re.compile(r"(?:^|&&|;|\|)\s*cd\b")
 
 PROJECT_MARKERS = [
     "package.json", "tsconfig.json", "deno.json",
@@ -249,6 +281,26 @@ def write_verification(command: str, path: str) -> None:
     save_state(path, state)
 
 
+def _is_repo_retargeted(command: str) -> bool:
+    # R-fix3 (Codex 8): evidence is bound to the EVENT's repo root, but
+    # COMMIT_PATTERN matches `git commit`/`push` anywhere in the command --
+    # including `cd repoB && git commit ...` or `git -C repoB commit ...`,
+    # which run in a DIFFERENT repo than the one that recorded the evidence.
+    # Conservative deny (safe direction, per reviewer): flag a chained `cd`
+    # alongside the commit, or a -C / --git-dir / --work-tree flag on the git
+    # invocation itself (any quoting of the flag's argument). A plain
+    # `git commit ...` with no directory retargeting is unaffected.
+    if _CHAINED_CD_RE.search(command):
+        return True
+    for match in _GIT_COMMIT_OPTIONS_RE.finditer(command):
+        opts = match.group(1)
+        if re.search(r"(?:^|\s)-C(?:\s|$)", opts):
+            return True
+        if "--git-dir" in opts or "--work-tree" in opts:
+            return True
+    return False
+
+
 def deny(reason: str) -> None:
     print(json.dumps({
         "hookSpecificOutput": {
@@ -286,29 +338,74 @@ def gate(command: str, path: str, root: str) -> None:
     deny(msg)
 
 
-def main() -> None:
-    try:
-        event = json.load(sys.stdin)
-    except json.JSONDecodeError:
-        return
+MALFORMED_DENY_REASON = "malformed hook event — denying commit gate fail-closed"
+
+
+def _dispatch(event: dict) -> None:
+    # R-fix2 (Codex 10): validate the envelope BEFORE any dict access. Roles
+    # are asymmetric on a malformed event:
+    #   RECORD (PostToolUse)  -> exit silently, record nothing. A best-effort
+    #                            recorder must never fabricate evidence or crash.
+    #   GATE   (PreToolUse, or the default/missing hook_event_name)
+    #          -> if the event is identifiably a commit-gate evaluation
+    #             (tool_name == "Bash" at the gate) but malformed, emit an
+    #             explicit deny (fail-closed: we cannot rule out that the
+    #             unparseable command was a commit). If it is not even
+    #             identifiable as a Bash tool call, exit silently — gating
+    #             every unrelated tool call on a parse failure would brick
+    #             the session, and the gate only owes fail-closed behavior
+    #             for commit attempts.
     if event.get("tool_name") != "Bash":
         return
-    command = event.get("tool_input", {}).get("command", "")
+
+    hook_event = event.get("hook_event_name", "")
+    is_gate = hook_event != "PostToolUse"
+
+    tool_input = event.get("tool_input")
+    if not isinstance(tool_input, dict):
+        if is_gate:
+            deny(MALFORMED_DENY_REASON)
+        return
+
+    command = tool_input.get("command", "")
+    if not isinstance(command, str):
+        if is_gate:
+            deny(MALFORMED_DENY_REASON)
+        return
     if not command:
         return
 
-    session_id = event.get("session_id") or "default"
-    cwd = event.get("cwd") or os.getcwd()
-    root = project_root(cwd)
-    hook_event = event.get("hook_event_name", "")
+    session_id = event.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        session_id = "default"
+    cwd = event.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        cwd = os.getcwd()
 
-    if hook_event == "PostToolUse":
-        if should_record(command):
-            try:
-                write_verification(command, state_file(session_id, root))
-            except (StateDirError, OSError):
-                pass  # cannot record safely; the gate will fail closed
-    elif COMMIT_PATTERN.search(command):  # PreToolUse (default) — gate only
+    try:
+        root = project_root(cwd)
+
+        if not is_gate:  # PostToolUse — record only
+            if should_record(command):
+                try:
+                    write_verification(command, state_file(session_id, root))
+                except (StateDirError, OSError):
+                    pass  # cannot record safely; the gate will fail closed
+            return
+
+        if not COMMIT_PATTERN.search(command):
+            return  # PreToolUse (default) — gate only fires on commit/push
+
+        # R-fix3 (Codex 8): evidence is bound to THIS event's repo root; deny
+        # a commit whose effective target could be a different repo, before
+        # ever consulting recorded evidence.
+        if _is_repo_retargeted(command):
+            deny(
+                "run git commit as a standalone command from the repo root "
+                "(no cd/-C/--git-dir)"
+            )
+            return
+
         # R4-4: catch BOTH the security refusal and any I/O error, and emit a
         # deny DECISION (not a bare exit 1 — a PreToolUse exit 1 does NOT block).
         try:
@@ -323,6 +420,25 @@ def main() -> None:
                 )
             return
         gate(command, path, root)
+    except Exception:
+        # R-fix2: nothing in either path may raise an uncaught exception on
+        # any input. An unexpected failure below the envelope checks above
+        # still fails closed on the GATE path and silently on RECORD.
+        if is_gate:
+            deny(MALFORMED_DENY_REASON)
+
+
+def main() -> None:
+    try:
+        event = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(event, dict):
+        return  # not identifiable as anything (e.g. a top-level `[]`) -> no-op
+    try:
+        _dispatch(event)
+    except Exception:
+        pass  # last-resort safety net; _dispatch already fails closed on GATE
 
 
 if __name__ == "__main__":
