@@ -688,6 +688,45 @@ else
     bad "regression: 'git log --grep=commit' wrongly gated (rc=$GATE_RC, out=$GATE_OUT)"
 fi
 
+# --- Position-aware git parse (Codex re-gate-3): the three former false-DENYs.
+#     Retarget/subcommand detection now respects git's structure
+#     (`git [GLOBAL-OPTS] <subcommand> [SUBCOMMAND-ARGS]`), so a `-C` that is
+#     `commit`'s OWN reuse option, a `cd` that is only a `-m` message value, and a
+#     `commit` that is only a `--grep` flag value are no longer misread. ---
+# (1) `git commit -C HEAD`: -C is AFTER the subcommand -> commit's own reuse
+#     option, not a global retarget. With fresh evidence the gate must APPROVE.
+cflag_sess="smoke-$$-${RANDOM}-commit-Cflag"
+record "$cflag_sess" "make test"
+record "$cflag_sess" "make lint"
+run_gate_cmd "$cflag_sess" "$WORK" "$WORK" "git commit -C HEAD"
+if [ "$GATE_RC" -eq 0 ] && [ -z "$GATE_OUT" ]; then
+    ok "regression: 'git commit -C HEAD' (commit's own -C) is not a false retarget deny"
+else
+    bad "regression: 'git commit -C HEAD' wrongly gated (rc=$GATE_RC, out=$GATE_OUT)"
+fi
+
+# (2) `git commit -m cd`: the `cd` is a `-m` message VALUE, not a chained command
+#     word, so it is not a false retarget. With fresh evidence the gate APPROVES.
+cdmsg_sess="smoke-$$-${RANDOM}-commit-cd-msg"
+record "$cdmsg_sess" "make test"
+record "$cdmsg_sess" "make lint"
+run_gate_cmd "$cdmsg_sess" "$WORK" "$WORK" "git commit -m cd"
+if [ "$GATE_RC" -eq 0 ] && [ -z "$GATE_OUT" ]; then
+    ok "regression: 'git commit -m cd' (cd as a message value) is not a false retarget deny"
+else
+    bad "regression: 'git commit -m cd' wrongly gated (rc=$GATE_RC, out=$GATE_OUT)"
+fi
+
+# (3) `git log --grep commit` (space form): the `commit` token is the VALUE of
+#     --grep, not the subcommand, so the gate stays SILENT (not a commit).
+grepsp_sess="smoke-$$-${RANDOM}-grep-commit-space"
+run_gate_cmd "$grepsp_sess" "$WORK" "$WORK" "git log --grep commit"
+if [ "$GATE_RC" -eq 0 ] && [ -z "$GATE_OUT" ]; then
+    ok "regression: 'git log --grep commit' (space form) is not over-detected as a commit (gate silent)"
+else
+    bad "regression: 'git log --grep commit' wrongly gated (rc=$GATE_RC, out=$GATE_OUT)"
+fi
+
 # --- FX4: malformed gate event. A PreToolUse Bash event with `tool_input: null`
 #     (identifiably a commit-gate evaluation but unparseable) must emit an EXPLICIT
 #     deny (fail-closed) and never raise a traceback.

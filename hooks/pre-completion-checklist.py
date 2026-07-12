@@ -7,11 +7,12 @@ One script, two Claude Code events (selected via hook_event_name in stdin):
               deny if this session has not recorded BOTH a test and a lint
               run for this working directory. Also denies a commit whose
               effective target could be a DIFFERENT repo than this event's
-              (a chained `cd &&`, or a `-C`/`--git-dir`/`--work-tree`
-              global option) before ever consulting recorded evidence. Commit
-              detection is a best-effort NUDGE (raw-text regex OR a shlex token
-              scan) and retarget detection a simple token check — NOT a full
-              shell parser; the git-level `hooks/pre-commit-verify.sh` is the
+              (a chained `cd &&`, or a GLOBAL `-C`/`--git-dir`/`--work-tree`
+              option BEFORE the subcommand) before ever consulting recorded
+              evidence. Commit detection is a best-effort NUDGE (raw-text regex
+              OR a position-aware git-argument parse) and retarget detection a
+              position-aware check of git's GLOBAL options — NOT a full shell
+              parser; the git-level `hooks/pre-commit-verify.sh` is the
               enforcing boundary. Never records anything.
   PostToolUse (matcher: Bash) — RECORD only. PostToolUse fires ONLY after a
               tool call SUCCEEDS (PostToolUseFailure fires on failure and is
@@ -93,25 +94,26 @@ LINT_RE = re.compile(
 # This gate is a best-effort NUDGE, not the enforcing boundary: the git-level
 # `hooks/pre-commit-verify.sh` hook is what actually enforces verification at
 # commit time. So this detection is deliberately SIMPLE and ROBUST rather than a
-# full shell parser — an earlier shlex segment-parser produced a rabbit hole of
-# shell-parse edge cases for no enforcement benefit.
+# full shell parser — it parses git's own argument STRUCTURE
+# (`git [GLOBAL-OPTIONS] <subcommand> [SUBCOMMAND-ARGS]`), not arbitrary shell.
 #
 # Commit detection is two independent checks (see _analyze_command): a regex over
 # the RAW string matching a `git`, then zero-or-more option tokens, then
 # `commit`/`push` in subcommand position — catching wrapper prefixes (`env`,
 # `command`, `exec`, `bash -c "..."`), comment/newline boundaries, and
-# `git -C /path commit`; OR a shlex token scan catching the quoted spaced-path
-# case `git -C "/other repo" commit` that breaks the regex option run. It does
-# NOT match `git log --grep=commit` (commit/push must be the subcommand, not a
-# flag value).
+# `git -C /path commit`; OR a position-aware git-argument parse (_parse_git) that
+# walks past git's GLOBAL options to find the real subcommand, so a quoted
+# spaced-path option (`git -C "/other repo" commit`) is still detected while a
+# `commit` token that is only a FLAG VALUE (`git log --grep commit`) is NOT.
 #
-# Retarget detection is a simple token check covering the common `-C`,
-# `--git-dir`, `--work-tree`, and `cd &&` forms; it intentionally does NOT fully
-# parse shell. A quoted `-m` message stays one token, so
-# `git commit -m "release; cd notes"` is not a false positive. Exotic
-# subshell/eval forms (e.g. `(cd /other && git commit)`, which tokenizes to
-# `(cd` rather than a bare `cd`) may evade this nudge but are still blocked at
-# commit time by the git hook.
+# Retarget detection is position-aware: a retarget flag only counts when it is a
+# GLOBAL option BEFORE the subcommand (`git -C <path> commit`), so `commit`'s own
+# `-C <commit>` reuse option (`git commit -C HEAD`) is not a false positive; plus
+# a `cd` that is a chained COMMAND WORD (first token, or after a shell operator),
+# so `cd` inside a quoted message (`git commit -m "release; cd notes"`) or as a
+# message value (`git commit -m cd`) is not flagged. Exotic subshell/eval forms
+# (e.g. `(cd /other && git commit)`, which tokenizes to `(cd` rather than a bare
+# `cd`) may evade this nudge but are still blocked at commit time by the git hook.
 _COMMIT_RE = re.compile(
     r"\bgit\b(?:\s+-{1,2}\S+(?:[=\s]\S+)?)*\s+(?:commit|push)\b"
 )
@@ -309,57 +311,104 @@ def _is_git(word: str) -> bool:
     return word == "git" or word.endswith("/git")
 
 
-def _token_scan_is_commit(tokens: list) -> bool:
-    # A `git` token (exact `git` or `.../git`) followed LATER by a `commit`/`push`
-    # token. Catches the quoted spaced-path option case `git -C "/other repo"
-    # commit` whose path breaks the regex `-\S+` option run.
-    saw_git = False
-    for tok in tokens:
-        if _is_git(tok):
-            saw_git = True
-        elif saw_git and tok in ("commit", "push"):
+# Global options that CONSUME the next token as their value when not `=`-glued.
+# Erring toward "takes no value" only causes a safe MISS for a nudge (we would
+# read a value as the subcommand), never a false positive — so an unknown
+# value-taking global is acceptable here.
+_VALUE_TAKING_GLOBALS = frozenset({
+    "-C", "-c", "--git-dir", "--work-tree",
+    "--namespace", "--exec-path", "--config-env",
+})
+
+# Shell operators that, when they PRECEDE a `cd` token, mark that `cd` as a
+# chained command word (a real directory change) rather than an argument value.
+_SHELL_OPERATORS = ("&&", "||", ";", "|", "&")
+
+
+def _parse_git(tokens: list):
+    # Position-aware parse of the FIRST git invocation, respecting git's own
+    # structure: `git [GLOBAL-OPTIONS] <subcommand> [SUBCOMMAND-ARGS]`. Returns
+    # (found, subcommand_or_None, global_opts). This lets the gate tell a GLOBAL
+    # `-C <path>` retarget (BEFORE the subcommand) apart from `commit`'s own
+    # `-C <commit>` option (AFTER it), and tell the `commit`/`push` subcommand
+    # apart from a `commit` token that is only a flag VALUE (`git log --grep
+    # commit`).
+    for i, tok in enumerate(tokens):
+        if not _is_git(tok):
+            continue
+        global_opts = []
+        j = i + 1
+        while j < len(tokens):
+            opt = tokens[j]
+            if not opt.startswith("-"):
+                return True, opt, global_opts  # first non-option token = subcommand
+            global_opts.append(opt)
+            # A value-taking global WITHOUT an inline `=` consumes the NEXT token.
+            if "=" not in opt and opt in _VALUE_TAKING_GLOBALS:
+                j += 1
+            j += 1
+        return True, None, global_opts  # git with only options, no subcommand
+    return False, None, []
+
+
+def _is_retarget_global(opt: str) -> bool:
+    # A GLOBAL git option that points the command at a DIFFERENT working tree/repo:
+    # `-C`/`-C<glued>`, or `--git-dir`/`--work-tree` (bare or `=`-glued). NOT `-c`
+    # (config), which does not retarget.
+    if opt == "-C" or (opt.startswith("-C") and len(opt) > 2):
+        return True
+    if opt in ("--git-dir", "--work-tree"):
+        return True
+    return opt.startswith("--git-dir=") or opt.startswith("--work-tree=")
+
+
+def _has_cd_command_word(tokens: list) -> bool:
+    # True if a bare `cd` appears as a chained COMMAND WORD: the FIRST token, or a
+    # token whose PREVIOUS token is a shell operator. A `cd` that is a message
+    # value (`git commit -m cd`, prev token `-m`) or inside a quoted message
+    # (`"release; cd notes"`, one token) is NOT a command word — no false positive.
+    for i, tok in enumerate(tokens):
+        if tok != "cd":
+            continue
+        if i == 0 or tokens[i - 1] in _SHELL_OPERATORS:
             return True
     return False
 
 
-def _is_retarget_token(tok: str) -> bool:
-    # A single token that points a git command at a DIFFERENT working tree/repo:
-    # a bare `cd`, a `-C`/`-C<glued>` option, or `--git-dir`/`--work-tree` (bare
-    # or `=`-glued). A quoted `-m` message stays ONE token, so operators or a
-    # `cd` inside it never match here — no message false positive.
-    if tok == "cd":
-        return True
-    if tok == "-C" or (tok.startswith("-C") and len(tok) > 2):
-        return True
-    if tok in ("--git-dir", "--work-tree"):
-        return True
-    return tok.startswith("--git-dir=") or tok.startswith("--work-tree=")
-
-
 def _analyze_command(command: str):
     # Best-effort NUDGE (see the module comment above _COMMIT_RE). Returns
-    # (is_commit, is_retargeted) via two independent, simple checks.
+    # (is_commit, is_retargeted).
     #
     # is_commit: a raw-text regex for a `git ... commit|push` form (catches
     # wrapper prefixes, comment/newline boundaries, `git -C /path commit`), OR a
-    # shlex token scan (catches the quoted spaced-path option case).
+    # position-aware parse whose SUBCOMMAND is `commit`/`push` (catches the quoted
+    # spaced-path option case, and rejects a `commit` that is only a flag value).
     #
-    # is_retargeted: any token is a directory-retarget signal (cd / -C /
-    # --git-dir / --work-tree). On unbalanced quotes we cannot tokenize, so a
-    # commit-looking command is conservatively treated as retargeted (deny).
+    # is_retargeted (only when is_commit): a GLOBAL retarget option BEFORE the
+    # subcommand (-C / --git-dir / --work-tree), or a chained `cd` command word.
+    # On unbalanced quotes we cannot tokenize, so a commit-looking command is
+    # conservatively treated as retargeted (deny).
     try:
         tokens = shlex.split(command)
     except ValueError:
         tokens = None
 
-    is_commit = bool(_COMMIT_RE.search(command))
-    if not is_commit and tokens is not None:
-        is_commit = _token_scan_is_commit(tokens)
+    if tokens is not None:
+        found, subcommand, global_opts = _parse_git(tokens)
+    else:
+        found, subcommand, global_opts = False, None, []
+
+    is_commit = bool(_COMMIT_RE.search(command)) or (
+        found and subcommand in ("commit", "push")
+    )
 
     if tokens is None:
         is_retargeted = is_commit  # unparseable commit-looking command -> deny
     else:
-        is_retargeted = any(_is_retarget_token(tok) for tok in tokens)
+        is_retargeted = is_commit and (
+            any(_is_retarget_global(opt) for opt in global_opts)
+            or _has_cd_command_word(tokens)
+        )
     return is_commit, is_retargeted
 
 
