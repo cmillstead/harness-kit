@@ -40,7 +40,8 @@ violations=()
 # here would silently swallow a git failure under set -euo pipefail and the
 # loop would just see empty input, scanning nothing while exiting 0.
 staged_list="$(mktemp "${TMPDIR:-/tmp}/no-mocks-staged.XXXXXX")"
-trap 'rm -f "$staged_list"' EXIT
+match_tmp="$(mktemp "${TMPDIR:-/tmp}/no-mocks-match.XXXXXX")"
+trap 'rm -f "$staged_list" "$match_tmp"' EXIT
 
 if ! git diff --cached --name-only --diff-filter=ACMR -z > "$staged_list"; then
     echo "no-mocks: failed to enumerate staged files" >&2
@@ -64,19 +65,34 @@ while IFS= read -r -d '' file; do
         # (grep rc 1, tolerated — this includes an earlier grep in the chain
         # filtering everything out) from a genuine grep error (rc > 1) so an
         # error can't be mistaken for a clean pass.
+        #
+        # matches=$(pipeline) would only expose the LAST command's exit
+        # status via $? — an error in an upstream grep stage (e.g. the
+        # '^+++' or 'mock-ok:' filters) would be masked by a downstream
+        # grep's rc, and could silently look like a clean "no match".
+        # Redirect the pipeline's output to a file instead of a command
+        # substitution so PIPESTATUS reflects every stage of the bare
+        # pipeline, then check every grep's rc individually.
         set +e
-        matches=$(printf '%s\n' "$diff_out" \
+        printf '%s\n' "$diff_out" \
             | grep -E '^\+' \
             | grep -v '^+++' \
             | grep -v 'mock-ok:' \
-            | grep -E "$pattern")
-        grep_rc=$?
+            | grep -E "$pattern" > "$match_tmp"
+        pipe_rcs=("${PIPESTATUS[@]}")
         set -e
 
-        if [ "$grep_rc" -gt 1 ]; then
-            echo "no-mocks: grep failed (rc=$grep_rc) scanning $file for $pattern" >&2
-            exit 1
-        fi
+        # pipe_rcs[0] is printf; pipe_rcs[1..4] are the four greps in order.
+        stage=0
+        for rc in "${pipe_rcs[@]}"; do
+            if [ "$stage" -gt 0 ] && [ "$rc" -gt 1 ]; then
+                echo "no-mocks: grep stage $stage failed (rc=$rc) scanning $file for $pattern" >&2
+                exit 1
+            fi
+            stage=$((stage + 1))
+        done
+
+        matches="$(cat "$match_tmp")"
 
         if [ -n "$matches" ]; then
             violations+=("$file: $pattern")
