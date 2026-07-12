@@ -2720,4 +2720,45 @@ git commit -m "ci: shellcheck + py_compile + smoke on Linux/macOS/pre-commit, le
 - **Portability** preserved (Linux + macOS, CI-enforced across raw-hook and pre-commit modes); shellcheck-clean (SC2086/SC2016 disables scoped with reasons; snapshot in python to avoid SC2012; no smoke line begins with a non-`disable` `# shellcheck` token — round-4 R4-6); `touch -t`/`os.stat`/`cmp` are BSD+GNU safe; no `mapfile`/associative arrays (bash 3.2). ✔
 - **Deterministic tests** — hermetic git config (`GIT_CONFIG_GLOBAL/SYSTEM=/dev/null`) + the `HARNESS_KIT_HOOK_MODE` seam remove any dependency on the runner's `pre-commit`/global config; CI exercises both install paths with a pinned framework version. ✔
 - **Complete file contents / precise diffs** for every change; each task ends with verification then commit; conventional-commit messages throughout. ✔
-- **`no-known-broken` honored** — the redesigned hooks are behaviorally verified by the **40-assertion** smoke test (record-after-exec, R1 negative recordings, deny/allow, 3 cross-repo isolation cases (R4-1a/b/c), insecure-state-dir fail-closed (R4-4), stop-verify all guard paths incl. both priming blocks, stale+future stamp, 5-way chaining, content+mode idempotency incl. `.git/hooks`, foreign-config banner + config-unchanged, near-miss foreign config (R4-3), linked-worktree **refusal** + shared-dir-untouched + primary-commit-unaffected (R5-1), non-exec-marker in-transaction repair (R5-2), and an external-`core.hooksPath` refusal verified by recursive snapshot (SNAP)), not just asserted. ✔
+- **`no-known-broken` honored** — the redesigned hooks are behaviorally verified by the **40-assertion** smoke test (record-after-exec, R1 negative recordings, deny/allow, 3 cross-repo isolation cases (R4-1a/b/c), insecure-state-dir fail-closed (R4-4), stop-verify all guard paths incl. both priming blocks, stale+future stamp, 5-way chaining, content+mode idempotency incl. `.git/hooks`, foreign-config banner + config-unchanged, near-miss foreign config (R4-3), linked-worktree **refusal** + shared-dir-untouched + primary-commit-unaffected (R5-1), non-exec-marker in-transaction repair (R5-2), and an external-`core.hooksPath` refusal verified by recursive snapshot (SNAP)), not just asserted. ✔ *(Post-execution: extended to **56 assertions** — see the fix round below.)*
+
+---
+
+## Post-execution fix round (Codex R6 REVISE + QA + doc-drift)
+
+The 40 smoke assertions were **logic-reviewed** across 6 planning rounds but never **executed** until Phase 5 T11a. First execution + three end-gates (feature QA, doc-drift, post-exec Codex) surfaced real defects — including one pre-existing (`no-mocks.sh`) and one in this-session code (`stop-verify.sh`) that six rounds of logic review missed because the tests hadn't run. User elected to fix **everything** (all tiers) before release. All fixes landed as `2e8417c..HEAD`; smoke went 40 → **56** assertions; direct + framework (pre-commit 4.6.0) modes both green; re-gated by Codex.
+
+| # | Source | Finding | Disposition | Commit |
+|---|--------|---------|-------------|--------|
+| pre-exec | T11a first run | `no-mocks.sh:50` `grep -v '^\+\+\+'` — `\+` is one-or-more in BSD+GNU BRE, strips every added line → hook silently allowed all mocks (pre-existing, commit 071ec5a) | Fix (literal `'^+++'`) | 6dcaa71 |
+| C1 | Codex R6-1 | `.pre-commit-config.yaml` post-commit hook lacked `always_run` → framework skipped cleanup (39/1) | Fix (`always_run: true` on all 3 hooks — parity with direct mode) | 5cda9f2 |
+| C2 | Codex R6-2 | `install.sh` trusted any marker-bearing hook body, merely `chmod`'d it → marker-only hook falsely "repaired" | Fix (re-materialize marker-owned hooks byte-for-byte in-transaction) | 32bdcf1 |
+| C3 | Codex R6-3 | `_snap_one` unchecked `: > "$dst.exists"` → snapshot gap makes rollback delete a real hook | Fix (`|| return 1`) | 32bdcf1 |
+| C4 | Codex R6-4 | `install.sh` bundle destinations followed a symlinked ancestor OUT of the repo (wrote+chmod'd external files) | Fix (`assert_contained` on every dest dir + `refuse_symlink_leaf` on every leaf; fatal) | 32bdcf1 |
+| C5 | Codex R6-5 / QA P2 | `stop-verify.sh` two-line parse collapsed on empty counter → junk file `0`/`1` written to / deleted from project root | Fix (`sed -n 1p/2p` + `/*/stop-*` validation) | 7c11d4a |
+| C6 | Codex R6-6 | `stop-verify.sh` non-object JSON (`[]`) raised AttributeError → both loop guards lost (unbounded block) | Fix (`isinstance(dict)` coerce + bash empty-parse backstop) | 7c11d4a |
+| C7 | Codex R6-7 | `stop-verify.sh` malformed `package.json` silently disabled verification | Fix (malformed → BLOCK via FAILED flow, still Guard-1/2 bounded) | 7c11d4a |
+| C8 | Codex R6-8 | `checklist.py` evidence in repo A authorized `cd repoB && git commit` / `git -C repoB commit` | Fix (`_is_repo_retargeted` denies chained-`cd` + `-C`/`--git-dir`/`--work-tree`) | 3866ef4 |
+| C9 | Codex R6-9 | `checklist.py` allowlist `\b` accepted prefixes → `make test-noop` recorded evidence | Fix (`(?=\s\|$)` anchor) | 3866ef4 |
+| C10 | Codex R6-10 | `checklist.py` malformed events failed open (bare exit ≠ PreToolUse deny) | Fix (envelope validation + explicit deny on malformed commit-gate; nothing raises) | 3866ef4 |
+| C11 | Codex R6-11 | `no-mocks.sh` newline/quotePath-quoted staged filenames bypassed the scan | Fix (`--name-only -z` + `read -r -d ''`) | 85e9ca6 |
+| S1 | Codex sec / QA | `no-mocks.sh` renamed-and-modified test files (status `R`) skipped | Fix (`--diff-filter=ACMR`) | 85e9ca6 |
+| S2 | Codex sec | `no-mocks.sh` terminal `\|\| true` masked git-diff failures, not just grep no-match | Fix (capture diff separately) | 85e9ca6 |
+| S3 | Codex sec | smoke gate helpers checked stdout not python exit → crash = false green | Fix (assert hook exit status) | cfdf08e |
+| S4 | Codex sec | smoke temp hook state written outside `$WORK` | Fix (`TMPDIR` inside `$WORK`) | cfdf08e |
+| S5 | Codex sec | smoke `snapshot` omitted dir modes + symlink-to-dir | Fix (record dir + symlink entries) | cfdf08e |
+| S6 | Codex sec | `ci.yml` used mutable `actions/checkout@v4` | Fix (pin full SHA `34e1148…`, v4.3.1) | efab139 |
+| Q1 | QA P3 | `install.sh` python3 unchecked hard dep → mid-run death | Fix (preflight) | 32bdcf1 |
+| Q2 | QA P3 | `install.sh` `.gitignore` append merges with a no-trailing-newline last line | Fix (newline guard) | 32bdcf1 |
+| Q3 | QA P3 | `install.sh` partial framework install → false "not found" msg + double-wiring | Fix (`install_precommit_framework` returns 2 vs 1; no raw fallback on wiring failure) | 32bdcf1 |
+| D1 | doc-drift | README uninstall omitted removing merged `.claude/settings.json` hook entries (ship-blocker) | Fix (new uninstall step 2) | 4152aea |
+| D2 | doc-drift / QA | README "What It Creates" missing `post-commit-cleanup.sh` + `SKILL.md` rows | Fix (2 rows) | 4152aea |
+| D3 | doc-drift | `pre-commit-verify.sh:12` phantom `harness-run` comment | Fix (delete comment) | d4d0146 |
+| D4 | doc-drift | `install.sh` header listed 6 of 10 steps | Fix (enumerate all 10) | 32bdcf1 |
+| COV | QA gaps | 5 coverage gaps: rollback path, symlink refusal, stop-verify insecure state dir, stamp deletion, non-Python mock patterns | Fix (16 new smoke assertions, 40→56) | cfdf08e |
+| QA-P1 | QA P1 | "tests/ untracked → CI red" | **False positive** — `tests/smoke.sh` committed at 3192ad2 (mode 100755); reviewer used stale session-start snapshot | — |
+| QA-12 | QA info | `bash -n` satisfies the checklist "test" category | **Accepted as-is** — the checklist is a nudge for the user's own agent, not a security boundary; the git-level `pre-commit-verify.sh` + Stop hook are the enforcing backstops | — |
+
+**Fix-round count: 28 items → 26 Fix, 1 False positive (QA-P1), 1 Accepted-as-is (QA-12).** No item deferred. New smoke assertion count: **56** (was 40), green in both direct and pre-commit-framework modes; `shellcheck` + `py_compile` clean.
+
+*One intentional deviation retained (user-approved):* a single `# mock-ok:` annotation on the `tests/smoke.sh` fixture line that deliberately writes a mock to prove the no-mocks hook blocks it; all other in-suite mock fixtures split the literal pattern tokens so the file needs no further annotations.
