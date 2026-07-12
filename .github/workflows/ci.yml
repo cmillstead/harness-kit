@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# S7: least privilege — the workflow only needs to read the repo.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck hooks and installer
+        run: shellcheck hooks/*.sh install.sh tests/smoke.sh
+      - name: Byte-compile the Python hook
+        run: python3 -m py_compile hooks/pre-completion-checklist.py
+
+  smoke-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run smoke test (raw-hook direct mode)
+        run: bash tests/smoke.sh
+
+  smoke-macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run smoke test (raw-hook direct mode)
+        run: bash tests/smoke.sh
+
+  smoke-precommit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pre-commit framework (pinned for determinism)
+        run: pipx install "pre-commit==4.6.0"
+      - name: Run smoke test (pre-commit framework mode)
+        env:
+          HARNESS_KIT_HOOK_MODE: precommit
+        run: bash tests/smoke.sh
