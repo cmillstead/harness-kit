@@ -29,8 +29,10 @@ cd /path/to/your/project
 | `docs/code-style.md` | Language-specific style rules (example — customize for your stack) | All |
 | `.harness/hooks/no-mocks.sh` | Git hook: block mocks in tests | All (git-level) |
 | `.harness/hooks/pre-commit-verify.sh` | Git hook: require test/lint before commit | All (git-level) |
+| `.harness/hooks/post-commit-cleanup.sh` | Git hook: delete the verification stamp after commit | All (git-level) |
 | `.pre-commit-config.yaml` | Hook configuration | All |
 | `skills/review.md` | Structural code-audit skill | All |
+| `.claude/skills/review/SKILL.md` | Claude Code skill form of `skills/review.md` (frontmatter + body) | Claude Code |
 | `docs/decision-record-template.md` | Capture the "why" behind decisions | — |
 | `docs/eval-template.md` | Domain-specific eval criteria (any team) | — |
 | `docs/escape-hatch-audit.md` | 10-step diagnostic for harness failure patterns | — |
@@ -127,16 +129,18 @@ The installer is mostly additive, but not purely: besides copying files it appen
 
 After deleting, prune the now-empty dirs: `.claude/skills/review`, `.claude/skills`, `.claude/hooks`, `.harness/hooks`, `.harness`, `skills` (leave any you also use for non-harness content).
 
-**2. Git hooks — restore only after removing our wrapper.** Find your hooks dir with `git rev-parse --git-path hooks`. For each of `pre-commit` and `post-commit`, in this order:
+**2. Claude Code settings — remove the hook registrations you merged in.** If you followed the install "Next steps" and merged `settings-snippet.json` into `.claude/settings.json`, that file still has `Stop`, `PreToolUse`, and `PostToolUse` entries pointing at the `.claude/hooks/` scripts you just deleted — leave them and Claude Code will error on every stop and tool call. Open `.claude/settings.json` and delete those three harness entries (they reference `.claude/hooks/stop-verify.sh` and `.claude/hooks/pre-completion-checklist.py`). Remove other keys only if they are yours to remove; if the harness entries were the only content, you can delete the file.
+
+**3. Git hooks — restore only after removing our wrapper.** Find your hooks dir with `git rev-parse --git-path hooks`. For each of `pre-commit` and `post-commit`, in this order:
 
 - If the hook file has **no** `# harness-kit hook` marker, it is not ours — leave it, and leave any `<hook>.harness-preserved` sibling, untouched. Do NOT restore over a hook you did not install.
 - If the hook file contains `# harness-kit hook`, it is ours — delete it. THEN, and only then, if a `<hook>.harness-preserved` sibling exists it is *your* original that we chained: rename it back (`mv pre-commit.harness-preserved pre-commit`).
 
 Restoring the preserved hook only after positively identifying and removing our wrapper guarantees you never overwrite a live non-harness hook.
 
-**3. `.pre-commit-config.yaml` — inspect before removing.** If it references `.harness/hooks/no-mocks.sh` *and* you had no pre-commit config before installing, it is the harness's copy — delete it. If you merged harness entries into a pre-existing config, remove only those entries by hand. If you enabled the pre-commit framework, also run `pre-commit uninstall && pre-commit uninstall --hook-type post-commit`.
+**4. `.pre-commit-config.yaml` — inspect before removing.** If it references `.harness/hooks/no-mocks.sh` *and* you had no pre-commit config before installing, it is the harness's copy — delete it. If you merged harness entries into a pre-existing config, remove only those entries by hand. If you enabled the pre-commit framework, also run `pre-commit uninstall && pre-commit uninstall --hook-type post-commit`.
 
-**4. Review by hand — never auto-delete.** `AGENTS.md`, `CLAUDE.md`, and `.cursor/rules/harness.md` are meant to be customized. Open each and remove the harness sections you no longer want, keeping your own edits.
+**5. Review by hand — never auto-delete.** `AGENTS.md`, `CLAUDE.md`, and `.cursor/rules/harness.md` are meant to be customized. Open each and remove the harness sections you no longer want, keeping your own edits.
 
 ## Customization
 
