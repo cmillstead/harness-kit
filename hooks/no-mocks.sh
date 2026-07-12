@@ -47,7 +47,7 @@ while IFS= read -r file; do
         # Find matches, exclude lines with mock-ok
         matches=$(git diff --cached --unified=0 -- "$file" \
             | grep -E '^\+' \
-            | grep -v '^\+\+\+' \
+            | grep -v '^+++' \
             | grep -v 'mock-ok:' \
             | grep -E "$pattern" || true)
 
