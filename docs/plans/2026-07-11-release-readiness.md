@@ -2775,4 +2775,21 @@ The Round-1 fixes were re-gated by Codex against the actual diff (empirical repr
 | #10 | Top-level non-dict event (`[]`) returns exit 0 with no deny | C10 (crash **is** fixed) | **Accepted as-designed** — the PreToolUse matcher is all-`Bash`, so the gate fires on every Bash call and only acts on commits; a non-dict event carries no command and cannot be a commit, so silent-allow is required (denying would block every non-commit tool call). The original fail-**open on an identifiable malformed commit** and the crash are both fixed; this residual is correct behavior, not a bug | — |
 | COV2 | Coverage for the four corrections | — | Fix (5 new smoke assertions: docs-leaf symlink refusal, no-mocks enum-failure abort, quoted-`-C` deny, subshell-`cd` deny, `cd`-in-message allow; 56→61) | d95ca33 |
 
-**Round-2 count: 6 re-gate items → 5 Fix (C4/S1-S2/C8+new-2/coverage), 1 Accepted-as-designed (#10).** The plan-overstatement finding (new-3) is resolved by this addendum. Second Codex re-gate: see release notes.
+**Round-2 count: 6 re-gate items → 5 Fix (C4/S1-S2/C8+new-2/coverage), 1 Accepted-as-designed (#10).** The plan-overstatement finding (new-3) is resolved by this addendum.
+
+### Fix round — Round 3 (second re-gate: right-size the nudge)
+
+The second Codex re-gate confirmed #4, new-2, and #10 RESOLVED (Codex explicitly agreed #10 is correct-by-design), but reproduced that the round-2 `shlex` gate rework was a **shell-parsing rabbit hole**: it fixed the targeted cases yet regressed wrapper detection the original regex caught (`env git commit`, `bash -c "git commit"`, `if true; then git commit`) and exposed further edge cases (comment-newline boundary, `<` redirection read as the subcommand, subshell-scope false positives). It also found the no-mocks `$?` check caught only the *final* grep, not an upstream stage.
+
+**Decision (user, "public scrutiny"): right-size the gate.** The commit gate is a Claude-Code *nudge*; the enforcing boundary is the git-level `pre-commit-verify.sh` hook. So detection is made broad-and-simple and retarget detection is made deliberately non-exhaustive, with the residual documented rather than chased through unbounded shell parsing.
+
+| Re-gate-2 # | Issue | Disposition | Commit |
+|---|---|---|---|
+| new-1/S1 | `no-mocks.sh` `set +e; $?` caught only the LAST grep; an upstream filter-grep error (rc≥2) was masked | Fix (inspect every `PIPESTATUS` stage; abort if any grep rc>1) | 6efe322 |
+| #8 + re-gate-2 new-1..4 | The `shlex` `_analyze_command` regressed wrapper detection and added parse-bug surface (comments, redirections, subshell scope/order) | Fix (**right-size**: `is_commit` = targeted regex OR token scan — catches `env`/`command`/`exec`/`bash -c` wrappers, comment-newline, redirection, quoted-path `-C`, and does **not** over-match `git log --grep=commit`; `is_retargeted` = simple `shlex.split` token check for `cd`/`-C`/`--git-dir`/`--work-tree`, which has **no** quoted-message false positive) | a4e8a4e |
+| re-gate-2 #10 | wording nits: docstring implied all malformed events deny; "would block every non-commit call" phrasing | Fix (docstring states the RECORD-silent / GATE-identifiable-deny / GATE-unidentifiable-allow asymmetry) | a4e8a4e |
+| COV3 | Coverage + honesty | Fix (smoke: updated the obsolete subshell-`cd` row to assert the accepted-allow limitation; added wrapper-deny + `git log --grep=commit`-allow assertions; 61→64) | a4e8a4e, 113bd5f |
+
+**Accepted, documented nudge limitations** (the git-level `pre-commit-verify.sh` hook enforces regardless): a `cd`/retarget *inside a subshell that also runs the commit* (`(cd /other && git commit)`) tokenizes to `(cd` and is not flagged; comment/`eval` forms beyond the detection regex. These evade the *reminder*, never the *enforcement*. README documents this ("Nudge vs. enforcement").
+
+**Round-3 count: 4 items → 4 Fix.** No item deferred. Smoke: **64** assertions (was 61), green in both direct and pre-commit-framework (4.6.0) modes; `shellcheck` + `py_compile` clean. Third Codex re-gate: see release notes.
