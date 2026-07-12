@@ -37,15 +37,20 @@ TEST_PATTERNS='test[s]?[/_]|_test\.|\.test\.|\.spec\.|test_'
 violations=()
 
 # Check only staged files
-while IFS= read -r file; do
+while IFS= read -r -d '' file; do
     # Skip non-test files
     if ! echo "$file" | grep -qE "$TEST_PATTERNS"; then
         continue
     fi
 
+    diff_out="$(git diff --cached --unified=0 -- "$file")" || {
+        echo "no-mocks: git diff failed for $file" >&2
+        exit 1
+    }
+
     for pattern in "${MOCK_PATTERNS[@]}"; do
         # Find matches, exclude lines with mock-ok
-        matches=$(git diff --cached --unified=0 -- "$file" \
+        matches=$(printf '%s\n' "$diff_out" \
             | grep -E '^\+' \
             | grep -v '^+++' \
             | grep -v 'mock-ok:' \
@@ -55,7 +60,7 @@ while IFS= read -r file; do
             violations+=("$file: $pattern")
         fi
     done
-done < <(git diff --cached --name-only --diff-filter=ACM)
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
 
 if [ ${#violations[@]} -gt 0 ]; then
     echo "============================================"
