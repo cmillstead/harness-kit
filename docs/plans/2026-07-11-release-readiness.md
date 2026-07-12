@@ -2792,4 +2792,17 @@ The second Codex re-gate confirmed #4, new-2, and #10 RESOLVED (Codex explicitly
 
 **Accepted, documented nudge limitations** (the git-level `pre-commit-verify.sh` hook enforces regardless): a `cd`/retarget *inside a subshell that also runs the commit* (`(cd /other && git commit)`) tokenizes to `(cd` and is not flagged; comment/`eval` forms beyond the detection regex. These evade the *reminder*, never the *enforcement*. README documents this ("Nudge vs. enforcement").
 
-**Round-3 count: 4 items → 4 Fix.** No item deferred. Smoke: **64** assertions (was 61), green in both direct and pre-commit-framework (4.6.0) modes; `shellcheck` + `py_compile` clean. Third Codex re-gate: see release notes.
+**Round-3 count: 4 items → 4 Fix.** No item deferred. Smoke: **64** assertions (was 61), green in both direct and pre-commit-framework (4.6.0) modes; `shellcheck` + `py_compile` clean.
+
+### Fix round — Round 4 (third re-gate: false positives + trap leak)
+
+The third Codex re-gate **validated the nudge/enforcement design** ("sound") and **independently confirmed the backstop** — `pre-commit-verify.sh` blocked both subshell- and `eval`-invoked unverified commits at git level with no involvement from the Claude gate. It found the round-3 right-sized gate had made the token check *position-blind*, producing FALSE POSITIVES (blocking legitimate commits — the worst outcome for a nudge), plus a temp-file leak.
+
+| Re-gate-3 # | Issue | Disposition | Commit |
+|---|---|---|---|
+| #1 | `git commit -C HEAD` (commit's own `-C` reuse-message option) and `git commit -m cd` (message token `cd`) wrongly DENIED — token check ignored position relative to the subcommand | Fix (**position-aware** `_parse_git`: retarget only when `-C`/`--git-dir`/`--work-tree` is a GLOBAL option *before* the subcommand; `cd` only as a chained command word — preceded by a shell operator or first token) | 0a7d1ed |
+| #2 | `git log --grep commit` (space form) wrongly DENIED — token fallback treated the `commit` value of `--grep` as the subcommand | Fix (subcommand = first non-option token after git's globals; `is_commit` only if that subcommand is `commit`/`push`) | 0a7d1ed |
+| #3 | `no-mocks.sh` EXIT trap armed only after BOTH `mktemp`s → a failed second alloc leaked the first temp file | Fix (empty-init both paths, arm the trap before either `mktemp`) | ef55ebb |
+| COV4 | Coverage | Fix (smoke +3: `git commit -C HEAD` allow, `git commit -m cd` allow, `git log --grep commit` silent; 64→67) | 0a7d1ed |
+
+**Round-4 count: 4 items → 4 Fix.** No item deferred. The position-aware parse is git-argument parsing (globals → subcommand → args), NOT full shell parsing — it fixes the false positives while keeping broad wrapper detection (`_COMMIT_RE`) and the accepted subshell-`cd` miss. Smoke: **67** assertions (was 64), green in both direct and pre-commit-framework (4.6.0) modes; `shellcheck` + `py_compile` clean. Fourth Codex re-gate: see release notes.
