@@ -125,6 +125,7 @@ mkdir -p docs
 if [ -f docs/golden-principles.md ]; then
     echo "⟳ docs/golden-principles.md already exists — skipping"
 else
+    refuse_symlink_leaf docs/golden-principles.md
     cp "$HARNESS_KIT/docs/golden-principles.md" docs/golden-principles.md
     echo "✓ Created docs/golden-principles.md"
 fi
@@ -134,6 +135,7 @@ for doc in harness-philosophy.md code-style.md; do
     if [ -f "docs/$doc" ]; then
         echo "⟳ docs/$doc already exists — skipping"
     else
+        refuse_symlink_leaf "docs/$doc"
         cp "$HARNESS_KIT/docs/$doc" "docs/$doc"
         echo "✓ Created docs/$doc"
     fi
@@ -495,6 +497,7 @@ for doc in decision-record-template.md eval-template.md escape-hatch-audit.md co
     if [ -f "docs/$doc" ]; then
         echo "⟳ docs/$doc already exists — skipping"
     else
+        refuse_symlink_leaf "docs/$doc"
         cp "$HARNESS_KIT/docs/$doc" "docs/$doc"
         echo "✓ Created docs/$doc"
     fi
