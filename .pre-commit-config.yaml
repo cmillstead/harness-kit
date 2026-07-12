@@ -13,6 +13,7 @@ repos:
         language: script
         stages: [pre-commit]
         pass_filenames: false
+        always_run: true
 
       - id: verify-before-commit
         name: Verify tests/lint ran before commit
@@ -20,6 +21,7 @@ repos:
         language: script
         stages: [pre-commit]
         pass_filenames: false
+        always_run: true
 
       - id: post-commit-cleanup
         name: Clean up verification stamp
@@ -27,3 +29,4 @@ repos:
         language: script
         stages: [post-commit]
         pass_filenames: false
+        always_run: true
