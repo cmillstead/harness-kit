@@ -39,9 +39,11 @@ violations=()
 # Enumerate staged files into a checked temp file. A process substitution
 # here would silently swallow a git failure under set -euo pipefail and the
 # loop would just see empty input, scanning nothing while exiting 0.
+staged_list=""
+match_tmp=""
+trap 'rm -f "$staged_list" "$match_tmp"' EXIT
 staged_list="$(mktemp "${TMPDIR:-/tmp}/no-mocks-staged.XXXXXX")"
 match_tmp="$(mktemp "${TMPDIR:-/tmp}/no-mocks-match.XXXXXX")"
-trap 'rm -f "$staged_list" "$match_tmp"' EXIT
 
 if ! git diff --cached --name-only --diff-filter=ACMR -z > "$staged_list"; then
     echo "no-mocks: failed to enumerate staged files" >&2
