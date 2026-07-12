@@ -1,0 +1,9 @@
+# macOS
+.DS_Store
+
+# Python bytecode (py_compile, hook runs)
+__pycache__/
+*.pyc
+
+# Harness verification stamp (single-use, never committed)
+.harness-verified
