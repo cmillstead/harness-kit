@@ -2759,6 +2759,20 @@ The 40 smoke assertions were **logic-reviewed** across 6 planning rounds but nev
 | QA-P1 | QA P1 | "tests/ untracked → CI red" | **False positive** — `tests/smoke.sh` committed at 3192ad2 (mode 100755); reviewer used stale session-start snapshot | — |
 | QA-12 | QA info | `bash -n` satisfies the checklist "test" category | **Accepted as-is** — the checklist is a nudge for the user's own agent, not a security boundary; the git-level `pre-commit-verify.sh` + Stop hook are the enforcing backstops | — |
 
-**Fix-round count: 28 items → 26 Fix, 1 False positive (QA-P1), 1 Accepted-as-is (QA-12).** No item deferred. New smoke assertion count: **56** (was 40), green in both direct and pre-commit-framework modes; `shellcheck` + `py_compile` clean.
+**Fix-round count: 28 items → 26 Fix, 1 False positive (QA-P1), 1 Accepted-as-is (QA-12).** No item deferred. Smoke assertion count after round 1: **56** (was 40). *(Round 2 below completes four items that a re-gate found were only partially fixed, and takes smoke to 61.)*
 
 *One intentional deviation retained (user-approved):* a single `# mock-ok:` annotation on the `tests/smoke.sh` fixture line that deliberately writes a mock to prove the no-mocks hook blocks it; all other in-suite mock fixtures split the literal pattern tokens so the file needs no further annotations.
+
+### Fix round — Round 2 (post-fix Codex re-gate residuals)
+
+The Round-1 fixes were re-gated by Codex against the actual diff (empirical reproductions, not logic review). It confirmed 12 of 16 items RESOLVED and reproduced **four residuals** where a fix was incomplete, plus two derived findings. All corrected below; re-validated at **61 assertions** green in both direct and pre-commit-framework (4.6.0) modes, `shellcheck` + `py_compile` clean.
+
+| Re-gate # | Residual | Round-1 row it corrects | Disposition | Commit |
+|---|---|---|---|---|
+| #4 | `assert_contained` guarded destination *directories*, but three `docs/*` **leaf** `cp` sites lacked `refuse_symlink_leaf` — a dangling `docs/golden-principles.md` symlink to an external path was written through (exit 0, external file created) | C4 (was "leaf guards added" — incomplete) | Fix (`refuse_symlink_leaf` on all 3 docs leaves) | 718ea3d |
+| new-1 / S1 | `no-mocks.sh` enumerated staged files in a **process substitution** (a `git diff --name-only` failure is not propagated under `set -e` → silently scans nothing, exit 0); and the match pipeline's `\|\| true` swallowed a grep **error** (rc≥2), not just no-match (rc 1) | S2 (was "unmask git-diff failure" — pipeline error path still masked) | Fix (checked temp-file enumeration; separate grep rc>1 abort) | 8f6c0e4 |
+| #8 / new-2 | The gate parsed shell as **regex**: `git -C "/quoted path" commit` evaded `COMMIT_PATTERN` (cross-repo evidence bypass) and `(cd … )` subshells evaded `_CHAINED_CD_RE`; conversely `git commit -m "release; cd notes"` was **wrongly denied** (operators inside a quoted message misread as chaining) | C8 (was "cross-repo deny" — regex-based, quote-blind) | Fix (shell-aware `shlex` tokenization: `_analyze_command`; denies quoted-`-C`/`--git-dir`/`--work-tree` + chained/subshell `cd`; ignores operators inside quoted tokens; conservative deny on unbalanced quotes) | 2e74101 |
+| #10 | Top-level non-dict event (`[]`) returns exit 0 with no deny | C10 (crash **is** fixed) | **Accepted as-designed** — the PreToolUse matcher is all-`Bash`, so the gate fires on every Bash call and only acts on commits; a non-dict event carries no command and cannot be a commit, so silent-allow is required (denying would block every non-commit tool call). The original fail-**open on an identifiable malformed commit** and the crash are both fixed; this residual is correct behavior, not a bug | — |
+| COV2 | Coverage for the four corrections | — | Fix (5 new smoke assertions: docs-leaf symlink refusal, no-mocks enum-failure abort, quoted-`-C` deny, subshell-`cd` deny, `cd`-in-message allow; 56→61) | d95ca33 |
+
+**Round-2 count: 6 re-gate items → 5 Fix (C4/S1-S2/C8+new-2/coverage), 1 Accepted-as-designed (#10).** The plan-overstatement finding (new-3) is resolved by this addendum. Second Codex re-gate: see release notes.
