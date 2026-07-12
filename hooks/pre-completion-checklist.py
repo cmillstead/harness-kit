@@ -7,8 +7,10 @@ One script, two Claude Code events (selected via hook_event_name in stdin):
               deny if this session has not recorded BOTH a test and a lint
               run for this working directory. Also denies a commit whose
               effective target could be a DIFFERENT repo than this event's
-              (a chained `cd`, or `-C`/`--git-dir`/`--work-tree`) before ever
-              consulting recorded evidence. Never records anything.
+              (a chained or subshelled `cd`, or a `-C`/`--git-dir`/`--work-tree`
+              global option) before ever consulting recorded evidence. Commit
+              and retarget detection is shell-aware (shlex tokenization), not
+              regex over raw text. Never records anything.
   PostToolUse (matcher: Bash) — RECORD only. PostToolUse fires ONLY after a
               tool call SUCCEEDS (PostToolUseFailure fires on failure and is
               NOT registered), so the event itself is the success signal — no
@@ -44,6 +46,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -79,20 +82,37 @@ LINT_RE = re.compile(
     r"\b(npm run lint|npx eslint|tsc --noEmit|mypy|ruff check|flake8|"
     r"cargo clippy|cargo check|make lint|make check|shellcheck)\b"
 )
-# Match a git commit/push even with a path prefix (/usr/bin/git) or leading
-# options (`git -C . commit`, `git -c k=v push`). Over-matching only widens the
-# gate, which is the safe direction (R3-3).
-COMMIT_PATTERN = re.compile(r"\bgit\b(?:\s+-\S+(?:\s+\S+)?)*\s+(?:commit|push)\b")
+# --- Shell-aware commit / repo-retarget detection ----------------------------
+# Replaces the old regex trio (COMMIT_PATTERN / _GIT_COMMIT_OPTIONS_RE /
+# _CHAINED_CD_RE) that parsed UNTOKENIZED shell text and so had two empirically
+# reproduced defects, both fixed by `_analyze_command` below via shlex:
+#   Defect 1 (Codex re-gate 8, SECURITY): a QUOTED `-C` path containing a space
+#     (`git -C "/other repo" commit`) never matched the option run `-\S+`, so the
+#     gate never fired and the commit was allowed against THIS repo's evidence —
+#     a cross-repo evidence bypass. A SUBSHELL `(cd /other && git commit)`
+#     likewise slipped past the chained-`cd` alternation (anchored only at
+#     ^/&&/;/|, never after `(`).
+#   Defect 2 (Codex re-gate 2, FALSE POSITIVE): shell operators INSIDE a quoted
+#     commit message (`git commit -m "release; cd notes"`) were read as real
+#     syntax, wrongly denying a legitimate commit.
+# shlex with punctuation_chars=True makes `&& || ; | & ( )` their own tokens
+# while a quoted argument (a `-m` message, a spaced `-C` path) stays a SINGLE
+# token with any operators inside it intact — which fixes both defects.
 
-# R-fix3 (Codex 8): same shape as COMMIT_PATTERN, but the option run before
-# commit/push is captured so we can inspect it for a repo-retargeting flag.
-_GIT_COMMIT_OPTIONS_RE = re.compile(
-    r"\bgit\b((?:\s+-\S+(?:\s+\S+)?)*)\s+(?:commit|push)\b"
-)
-# A `cd` chained onto the same command line (via &&, ;, or |) can move the
-# shell into a different repo before the commit runs, even though the event's
-# cwd (and thus the recorded evidence) never changed.
-_CHAINED_CD_RE = re.compile(r"(?:^|&&|;|\|)\s*cd\b")
+# git global options (before the subcommand) that consume a SEPARATE following
+# token as their value; used to skip that value when locating the subcommand, so
+# a value like `/other repo` is never mistaken for `commit`.
+_GIT_VALUE_OPTS = frozenset({
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace",
+    "--super-prefix", "--config-env", "--attr-source",
+})
+# Shell control-operator characters. A token composed ENTIRELY of these (`&&`,
+# `||`, `;`, `|`, `&`, `(`, `)`, `|&`, ...) is a segment separator. A redirect
+# like `>` or `>&` contains `<`/`>`, so it is NOT a separator (it stays an
+# argument token, harmless to detection).
+_CONTROL_CHARS = frozenset(";|&()")
+# A leading `NAME=value` shell assignment precedes the command word.
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 PROJECT_MARKERS = [
     "package.json", "tsconfig.json", "deno.json",
@@ -281,24 +301,124 @@ def write_verification(command: str, path: str) -> None:
     save_state(path, state)
 
 
-def _is_repo_retargeted(command: str) -> bool:
-    # R-fix3 (Codex 8): evidence is bound to the EVENT's repo root, but
-    # COMMIT_PATTERN matches `git commit`/`push` anywhere in the command --
-    # including `cd repoB && git commit ...` or `git -C repoB commit ...`,
-    # which run in a DIFFERENT repo than the one that recorded the evidence.
-    # Conservative deny (safe direction, per reviewer): flag a chained `cd`
-    # alongside the commit, or a -C / --git-dir / --work-tree flag on the git
-    # invocation itself (any quoting of the flag's argument). A plain
-    # `git commit ...` with no directory retargeting is unaffected.
-    if _CHAINED_CD_RE.search(command):
-        return True
-    for match in _GIT_COMMIT_OPTIONS_RE.finditer(command):
-        opts = match.group(1)
-        if re.search(r"(?:^|\s)-C(?:\s|$)", opts):
+def _segment_command(segment: list):
+    # The command word of a segment is its first token that is not a leading
+    # `NAME=value` shell assignment. Returns (command_word_or_None, arg_tokens).
+    idx = 0
+    while idx < len(segment) and _ASSIGN_RE.match(segment[idx]):
+        idx += 1
+    if idx >= len(segment):
+        return None, []
+    return segment[idx], segment[idx + 1:]
+
+
+def _git_subcommand(args: list):
+    # Walk a git invocation's argument tokens, skipping global option tokens and
+    # (for value-taking options like `-C`/`-c`/`--git-dir`) their separate value
+    # token, and return (subcommand_or_None, global_option_tokens_before_it). The
+    # subcommand is the first token that does not start with `-`.
+    globals_before = []
+    idx = 0
+    while idx < len(args):
+        tok = args[idx]
+        if tok.startswith("-"):
+            globals_before.append(tok)
+            idx += 2 if tok in _GIT_VALUE_OPTS else 1
+        else:
+            return tok, globals_before
+    return None, globals_before
+
+
+def _globals_retarget(global_opts: list) -> bool:
+    # True if any pre-subcommand global option points the commit at a different
+    # repo: `-C <path>` (bare or `-C<path>` glued) or `--git-dir`/`--work-tree`
+    # (bare or `--git-dir=`/`--work-tree=` glued). `-c <name>=<value>` (config,
+    # lowercase) is NOT a retarget.
+    for tok in global_opts:
+        if tok.startswith("-C"):
             return True
-        if "--git-dir" in opts or "--work-tree" in opts:
+        if tok in ("--git-dir", "--work-tree"):
+            return True
+        if tok.startswith("--git-dir=") or tok.startswith("--work-tree="):
             return True
     return False
+
+
+def _is_git(word: str) -> bool:
+    # A git invocation's command word is `git` or a path ending in `/git`
+    # (e.g. /usr/bin/git).
+    return word == "git" or word.endswith("/git")
+
+
+def _looks_like_commit(command: str) -> bool:
+    # Loose "should I be suspicious" check used ONLY on an unparseable command:
+    # does the raw text still mention git AND commit/push?
+    return bool(
+        re.search(r"\bgit\b", command)
+        and re.search(r"\b(?:commit|push)\b", command)
+    )
+
+
+def _analyze_command(command: str):
+    # Shell-aware replacement for COMMIT_PATTERN + _is_repo_retargeted. Returns
+    # (is_commit, is_retargeted). See the module-level comment near _GIT_VALUE_OPTS
+    # for the two defects (quoted `-C` bypass; `cd`-in-message false positive)
+    # this fixes.
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    # Drop newline from whitespace so an UNQUOTED newline becomes its own
+    # separator token (a `cd\ngit commit` retarget must not merge into one
+    # segment and fail open); a newline INSIDE a quoted message stays part of
+    # that single token.
+    lexer.whitespace = lexer.whitespace.replace("\n", "")
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        # Unbalanced quotes: fail CLOSED only if the raw text still looks like a
+        # commit; otherwise allow — the matcher is all-Bash, and we must not deny
+        # arbitrary unparseable NON-commit calls.
+        suspicious = _looks_like_commit(command)
+        return suspicious, suspicious
+    if not tokens:
+        suspicious = _looks_like_commit(command)
+        return suspicious, suspicious
+
+    # Split the token stream into command segments at operator/separator tokens.
+    segments = []
+    current = []
+    for tok in tokens:
+        if tok == "\n" or (tok and all(ch in _CONTROL_CHARS for ch in tok)):
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(tok)
+    if current:
+        segments.append(current)
+
+    is_commit = False
+    is_retargeted = False
+    has_cd = False
+    has_commit_segment = False
+    for segment in segments:
+        cmd_word, args = _segment_command(segment)
+        if cmd_word is None:
+            continue
+        if cmd_word == "cd":
+            has_cd = True
+            continue
+        if _is_git(cmd_word):
+            subcommand, global_opts = _git_subcommand(args)
+            if subcommand in ("commit", "push"):
+                is_commit = True
+                has_commit_segment = True
+                if _globals_retarget(global_opts):
+                    is_retargeted = True
+    # A directory change chained/subshelled alongside a commit retargets it.
+    # (A `cd` inside a quoted `-m` message is part of a single token, not a
+    # segment command word, so it never triggers this — fixing Defect 2.)
+    if has_cd and has_commit_segment:
+        is_retargeted = True
+    return is_commit, is_retargeted
 
 
 def deny(reason: str) -> None:
@@ -393,13 +513,17 @@ def _dispatch(event: dict) -> None:
                     pass  # cannot record safely; the gate will fail closed
             return
 
-        if not COMMIT_PATTERN.search(command):
+        # Shell-aware (shlex) trigger: is this a git commit/push, and does its
+        # effective target look like a DIFFERENT repo than this event's? See
+        # `_analyze_command` for the two defects the old regexes had.
+        is_commit, is_retargeted = _analyze_command(command)
+        if not is_commit:
             return  # PreToolUse (default) — gate only fires on commit/push
 
-        # R-fix3 (Codex 8): evidence is bound to THIS event's repo root; deny
-        # a commit whose effective target could be a different repo, before
-        # ever consulting recorded evidence.
-        if _is_repo_retargeted(command):
+        # Evidence is bound to THIS event's repo root; deny a commit whose
+        # effective target could be a different repo, before ever consulting
+        # recorded evidence.
+        if is_retargeted:
             deny(
                 "run git commit as a standalone command from the repo root "
                 "(no cd/-C/--git-dir)"
