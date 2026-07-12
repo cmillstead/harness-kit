@@ -23,6 +23,17 @@ HARNESS_KIT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# Hermeticity (Codex ~L22): keep ALL hook state INSIDE $WORK. The checklist and
+# stop-verify hooks derive their per-user state dir from tempfile.gettempdir()
+# (which honors $TMPDIR), so without this they leave a claude-harness-$(id -u)
+# dir under the real system temp after the run. Pointing $TMPDIR at a subdir of
+# $WORK means every hook-written state file AND every `mktemp -d` fixture below
+# lands under $WORK and is removed by the EXIT trap. Sub-repo fixtures each run
+# their own `git init`, so nesting them under $WORK's repo is inert (git resolves
+# the nearest .git). Fixtures that need an INSECURE base override $TMPDIR locally.
+export TMPDIR="$WORK/tmp"
+mkdir -p "$TMPDIR"
+
 pass=0
 fail=0
 ok()  { printf 'PASS: %s\n' "$1"; pass=$((pass + 1)); }
@@ -92,6 +103,12 @@ fi
 snapshot() {
     # Recursive content+mode+symlink snapshot of ${1:-$PWD}. Reused for the
     # idempotency check (whole repo) AND the external-hooksPath containment check.
+    # Codex ~L99: emit DIRECTORY entries (path + mode + "dir") and symlink-to-dir
+    # entries (path + target) as well as files, so a directory-mode change or a
+    # swapped symlink-to-dir is caught by the containment/idempotency diffs — not
+    # just file content/mode. Pure python stdlib (os.walk/os.lstat) is identical
+    # on BSD (macOS) and GNU. os.walk does NOT follow symlinks (followlinks=False),
+    # so a symlink-to-dir is recorded by target and never recursed into.
     python3 - "${1:-$PWD}" <<'PY'
 import hashlib, os, stat, sys
 root = sys.argv[1]
@@ -105,6 +122,18 @@ for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d == "hooks"]
             continue
         # Deeper than .git only ever reached under .git/hooks (others pruned above).
+    for name in sorted(dirnames):
+        path = os.path.join(dirpath, name)
+        relp = os.path.relpath(path, root)
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISLNK(info.st_mode):
+            rows.append("%s %o symlink:%s" % (relp, mode, os.readlink(path)))
+        else:
+            rows.append("%s %o dir" % (relp, mode))
     for name in sorted(filenames):
         path = os.path.join(dirpath, name)
         relp = os.path.relpath(path, root)
@@ -151,6 +180,73 @@ else
 fi
 git reset -q
 rm -f tests/test_sample.py
+
+# --- no-mocks FX3 coverage. Each fixture drives no-mocks.sh DIRECTLY against a
+# throwaway repo's staged index (like the stop-verify/checklist fixtures), so the
+# smoke's OWN commit never scans these generated files. The mock-pattern strings
+# below are split with an empty shell-quote (Magic''Mock, jest.moc''k) so the
+# literal pattern never appears on a smoke.sh line — the harness's own no-mocks
+# thus does not flag smoke.sh, so NO second exemption annotation is needed —
+# while the generated fixture file still contains the intact pattern for the
+# sub-repo's hook to detect.
+
+# (FX3) rename+modify: `git mv` a clean test file AND add a mock line in the same
+# index. --diff-filter=ACMR must include the renamed (R) path so it is scanned.
+nm_rn="$(mktemp -d)"
+(
+    cd "$nm_rn" || exit 1
+    git init -q && git config user.email a@b.c && git config user.name t
+    mkdir -p tests
+    printf 'def test_ok():\n    assert True\n    assert 1 == 1\n    assert 2 == 2\n    assert 3 == 3\n' > tests/test_orig.py
+    git add -A && git commit -q --no-verify -m init
+    git mv tests/test_orig.py tests/test_renamed.py
+    printf 'x = Magic''Mock()\n' >> tests/test_renamed.py
+    git add tests/test_renamed.py
+)
+nm_rn_out="$(cd "$nm_rn" && bash "$HARNESS_KIT/hooks/no-mocks.sh" 2>&1)"
+nm_rn_rc=$?
+if [ "$nm_rn_rc" -ne 0 ] && printf '%s' "$nm_rn_out" | grep -q "BLOCKED: Mock usage"; then
+    ok "no-mocks: rename+modify (--diff-filter ACMR) blocks an added mock in a renamed file"
+else
+    bad "no-mocks: rename+modify not blocked (rc=$nm_rn_rc)"
+fi
+rm -rf "$nm_rn"
+
+# (FX3) non-ASCII filename: NUL-delimited staged names (-z) so a UTF-8 path is
+# passed verbatim to the per-file diff (core.quotepath would otherwise mangle it).
+nm_ua="$(mktemp -d)"
+(
+    cd "$nm_ua" || exit 1
+    git init -q && git config user.email a@b.c && git config user.name t
+    mkdir -p tests
+    printf 'x = Magic''Mock()\n' > tests/tést.py
+    git add -A
+)
+nm_ua_out="$(cd "$nm_ua" && bash "$HARNESS_KIT/hooks/no-mocks.sh" 2>&1)"
+nm_ua_rc=$?
+if [ "$nm_ua_rc" -ne 0 ] && printf '%s' "$nm_ua_out" | grep -q "BLOCKED: Mock usage"; then
+    ok "no-mocks: non-ASCII filename (tests/tést.py) with a mock is blocked (-z NUL-delimited)"
+else
+    bad "no-mocks: non-ASCII filename not blocked (rc=$nm_ua_rc)"
+fi
+rm -rf "$nm_ua"
+
+# (QA gap) a NON-Python mock pattern run through the live hook on macOS/BSD grep.
+nm_js="$(mktemp -d)"
+(
+    cd "$nm_js" || exit 1
+    git init -q && git config user.email a@b.c && git config user.name t
+    printf 'jest.moc''k("./dep");\n' > app.test.js
+    git add -A
+)
+nm_js_out="$(cd "$nm_js" && bash "$HARNESS_KIT/hooks/no-mocks.sh" 2>&1)"
+nm_js_rc=$?
+if [ "$nm_js_rc" -ne 0 ] && printf '%s' "$nm_js_out" | grep -q "BLOCKED: Mock usage"; then
+    ok "no-mocks: a JS mock pattern in a .test.js file is blocked"
+else
+    bad "no-mocks: JS mock pattern not blocked (rc=$nm_js_rc)"
+fi
+rm -rf "$nm_js"
 
 # --- Test B: missing stamp blocks when a project marker exists ---
 printf '{"name":"demo"}\n' > package.json
@@ -270,6 +366,56 @@ else
 fi
 rm -rf "$fixture"
 
+# --- stop-verify insecure state dir (the missing test that let a Tier-1 bug survive).
+# Mirror the checklist's R4-4 fixture: point TMPDIR at a base where the per-user
+# state dir is pre-planted as a SYMLINK, then drive a RED repo (test -> exit 1)
+# with stop_hook_active:false. secure_state_dir() must reject the symlink so
+# COUNTER stays empty and Guard 2 is skipped. Assert BOTH signals: exit 2 (first
+# block still fires via Guard-less path) AND no file literally named `0` or `1`
+# was created in the project dir — the pre-fix bug wrote junk COUNTER files there.
+sv_bad_tmp="$(mktemp -d)"
+ln -s /tmp "$sv_bad_tmp/claude-harness-$(id -u)"
+sv_red="$(mktemp -d)"
+printf '{"scripts":{"test":"exit 1"}}\n' > "$sv_red/package.json"
+printf '{"stop_hook_active":false,"session_id":"smoke-sv-insecure"}' \
+    | TMPDIR="$sv_bad_tmp" CLAUDE_PROJECT_DIR="$sv_red" bash "$HARNESS_KIT/hooks/stop-verify.sh" >/dev/null 2>&1
+svbad_rc=$?
+if [ "$svbad_rc" -eq 2 ] && [ ! -e "$sv_red/0" ] && [ ! -e "$sv_red/1" ]; then
+    ok "stop-verify: insecure state dir -> exit 2, no junk 0/1 counter file (Guard 2 skipped)"
+else
+    bad "stop-verify: insecure state dir left junk or wrong exit (rc=$svbad_rc)"
+fi
+rm -rf "$sv_bad_tmp" "$sv_red"
+
+# --- stop-verify malformed package.json -> BLOCK (fails closed, exit 2) with a
+#     clear reason on stderr (FX2). A broken manifest must not silently disable
+#     verification.
+sv_mal="$(mktemp -d)"
+printf 'this is not json {' > "$sv_mal/package.json"
+svmal_out="$(printf '{"stop_hook_active":false,"session_id":"smoke-sv-malformed"}' \
+    | CLAUDE_PROJECT_DIR="$sv_mal" bash "$HARNESS_KIT/hooks/stop-verify.sh" 2>&1)"
+svmal_rc=$?
+if [ "$svmal_rc" -eq 2 ] && printf '%s' "$svmal_out" | grep -q "package.json is malformed"; then
+    ok "stop-verify: malformed package.json blocks (exit 2 + 'package.json is malformed')"
+else
+    bad "stop-verify: malformed package.json not blocked cleanly (rc=$svmal_rc)"
+fi
+rm -rf "$sv_mal"
+
+# --- stop-verify non-object JSON `[]` on stdin -> coerced to {}, no crash (FX2).
+#     Must be BOUNDED (exit 0 or 2) with no Python traceback on stderr.
+sv_arr="$(mktemp -d)"
+printf '{"scripts":{"test":"exit 1"}}\n' > "$sv_arr/package.json"
+svarr_out="$(printf '[]' | CLAUDE_PROJECT_DIR="$sv_arr" bash "$HARNESS_KIT/hooks/stop-verify.sh" 2>&1)"
+svarr_rc=$?
+if { [ "$svarr_rc" -eq 0 ] || [ "$svarr_rc" -eq 2 ]; } \
+   && ! printf '%s' "$svarr_out" | grep -q "Traceback"; then
+    ok "stop-verify: non-object JSON [] on stdin does not crash (bounded exit, no traceback)"
+else
+    bad "stop-verify: [] on stdin crashed or was unbounded (rc=$svarr_rc)"
+fi
+rm -rf "$sv_arr"
+
 # --- Test E: checklist gates at PreToolUse, records at PostToolUse (success-only) ---
 py_hook="$HARNESS_KIT/hooks/pre-completion-checklist.py"
 printf '{"name":"demo"}\n' > package.json   # marker so the gate engages
@@ -278,29 +424,43 @@ printf '{"name":"demo"}\n' > package.json   # marker so the gate engages
 # payloads carry no tool_response. The hook keys state on session_id + project
 # root; we set CLAUDE_PROJECT_DIR="$WORK" so record and gate resolve to the same
 # root deterministically (R3-3) without depending on the git-toplevel fallback.
+# Codex ~L290: every checklist-hook invocation's EXIT STATUS is checked. The hook
+# exits 0 on BOTH allow and deny, so a nonzero status means the python CRASHED —
+# and a crash prints NO stdout, which a stdout-only "no deny -> allowed" check
+# would silently misread as a PASS on an allow-expected assertion (a false green).
+# record() asserts rc==0 inline (it runs in this shell); the gate helpers store rc
+# in GATE_RC so each gate assertion can require GATE_RC -eq 0.
 record() {   # session, command-string
     printf '{"hook_event_name":"PostToolUse","tool_name":"Bash","session_id":"%s","cwd":"%s","tool_input":{"command":"%s"}}' "$1" "$WORK" "$2" \
         | CLAUDE_PROJECT_DIR="$WORK" python3 "$py_hook" >/dev/null 2>&1
+    rec_rc=$?
+    [ "$rec_rc" -eq 0 ] || bad "record: checklist hook crashed (rc=$rec_rc) for session $1"
 }
-gate_out() { # session -> gate stdout (empty means allow)
-    printf '{"hook_event_name":"PreToolUse","tool_name":"Bash","session_id":"%s","cwd":"%s","tool_input":{"command":"git commit -m x"}}' "$1" "$WORK" \
-        | CLAUDE_PROJECT_DIR="$WORK" python3 "$py_hook"
+run_gate_cmd() { # session, cwd, projdir, command -> sets GATE_OUT + GATE_RC
+    GATE_OUT="$(printf '{"hook_event_name":"PreToolUse","tool_name":"Bash","session_id":"%s","cwd":"%s","tool_input":{"command":"%s"}}' "$1" "$2" "$4" \
+        | CLAUDE_PROJECT_DIR="$3" python3 "$py_hook")"
+    GATE_RC=$?   # pipefail -> the python exit status, not printf's
+}
+run_gate() {    # session, cwd, projdir -> gate the default `git commit -m x`
+    run_gate_cmd "$1" "$2" "$3" "git commit -m x"
 }
 
 sess_unverified="smoke-$$-${RANDOM}-unverified"
-if printf '%s' "$(gate_out "$sess_unverified")" | grep -q '"permissionDecision": *"deny"'; then
+run_gate "$sess_unverified" "$WORK" "$WORK"
+if [ "$GATE_RC" -eq 0 ] && printf '%s' "$GATE_OUT" | grep -q '"permissionDecision": *"deny"'; then
     ok "E: unverified session -> PreToolUse deny"
 else
-    bad "E: expected a PreToolUse deny"
+    bad "E: expected a PreToolUse deny (rc=$GATE_RC)"
 fi
 
 sess_verified="smoke-$$-${RANDOM}-verified"
 record "$sess_verified" "npm test"
 record "$sess_verified" "npm run lint"
-if [ -z "$(gate_out "$sess_verified")" ]; then
+run_gate "$sess_verified" "$WORK" "$WORK"
+if [ "$GATE_RC" -eq 0 ] && [ -z "$GATE_OUT" ]; then
     ok "E: verified session (PostToolUse-recorded) -> commit allowed"
 else
-    bad "E: expected allow after recording test + lint"
+    bad "E: expected allow after recording test + lint (rc=$GATE_RC)"
 fi
 
 # --- R1: should_record rejects shell-metachar / non-anchored "verification" cmds ---
@@ -313,23 +473,25 @@ for bogus in 'npm test || true' 'echo npm test' 'FOO=bar npm test'; do
     neg_sess="smoke-$$-${RANDOM}-neg$neg_i"
     record "$neg_sess" "npm run lint"   # a real lint IS recorded
     record "$neg_sess" "$bogus"         # this must NOT count as a test
-    if printf '%s' "$(gate_out "$neg_sess")" | grep -q '"permissionDecision": *"deny"'; then
+    run_gate "$neg_sess" "$WORK" "$WORK"
+    if [ "$GATE_RC" -eq 0 ] && printf '%s' "$GATE_OUT" | grep -q '"permissionDecision": *"deny"'; then
         ok "R1: non-anchored command not recorded, gate still denies: $bogus"
     else
-        bad "R1: '$bogus' was wrongly accepted as a test verification"
+        bad "R1: '$bogus' was wrongly accepted as a test verification (rc=$GATE_RC)"
     fi
 done
 
 # --- R4-1: project root is resolved from the EVENT cwd, not a stale CLAUDE_PROJECT_DIR ---
 # Parameterized helpers so we can vary cwd and CLAUDE_PROJECT_DIR independently.
-record_in() {  # session, cwd, projdir, command
+record_in() {  # session, cwd, projdir, command  (rc checked — Codex ~L290)
     printf '{"hook_event_name":"PostToolUse","tool_name":"Bash","session_id":"%s","cwd":"%s","tool_input":{"command":"%s"}}' "$1" "$2" "$4" \
         | CLAUDE_PROJECT_DIR="$3" python3 "$py_hook" >/dev/null 2>&1
+    rec_rc=$?
+    [ "$rec_rc" -eq 0 ] || bad "record_in: checklist hook crashed (rc=$rec_rc) for session $1"
 }
-gate_in() {    # session, cwd, projdir -> gate stdout
-    printf '{"hook_event_name":"PreToolUse","tool_name":"Bash","session_id":"%s","cwd":"%s","tool_input":{"command":"git commit -m x"}}' "$1" "$2" \
-        | CLAUDE_PROJECT_DIR="$3" python3 "$py_hook"
-}
+# gate_in was folded into run_gate (session, cwd, projdir) above — it already
+# takes an explicit cwd/projdir and stores GATE_OUT/GATE_RC so the exit status
+# is asserted at every call site.
 
 repo2="$(mktemp -d)"
 ( cd "$repo2" && git init -q && printf '{"name":"r2"}\n' > package.json )
@@ -337,10 +499,11 @@ repo2="$(mktemp -d)"
 # (a) A commit from a project SUBDIRECTORY is still gated (root resolves to the repo top).
 mkdir -p "$WORK/subpkg"
 sub_sess="smoke-$$-${RANDOM}-sub"
-if printf '%s' "$(gate_in "$sub_sess" "$WORK/subpkg" "$WORK")" | grep -q '"permissionDecision": *"deny"'; then
+run_gate "$sub_sess" "$WORK/subpkg" "$WORK"
+if [ "$GATE_RC" -eq 0 ] && printf '%s' "$GATE_OUT" | grep -q '"permissionDecision": *"deny"'; then
     ok "R4-1a: commit from a subdirectory is still gated"
 else
-    bad "R4-1a: a subdirectory commit was not gated"
+    bad "R4-1a: a subdirectory commit was not gated (rc=$GATE_RC)"
 fi
 
 # (b) A verification run in repo2 must NOT authorize repo1, even though
@@ -348,20 +511,22 @@ fi
 xr_sess="smoke-$$-${RANDOM}-xrepo"
 record_in "$xr_sess" "$repo2" "$WORK" "npm test"
 record_in "$xr_sess" "$repo2" "$WORK" "npm run lint"
-if printf '%s' "$(gate_in "$xr_sess" "$WORK" "$WORK")" | grep -q '"permissionDecision": *"deny"'; then
+run_gate "$xr_sess" "$WORK" "$WORK"
+if [ "$GATE_RC" -eq 0 ] && printf '%s' "$GATE_OUT" | grep -q '"permissionDecision": *"deny"'; then
     ok "R4-1b: a verification in a second repo does not authorize the first"
 else
-    bad "R4-1b: repo2 verification wrongly authorized repo1"
+    bad "R4-1b: repo2 verification wrongly authorized repo1 (rc=$GATE_RC)"
 fi
 
 # (c) A verification in repo1 must NOT be consumed by a commit in repo2.
 xr2_sess="smoke-$$-${RANDOM}-xrepo2"
 record_in "$xr2_sess" "$WORK" "$WORK" "npm test"
 record_in "$xr2_sess" "$WORK" "$WORK" "npm run lint"
-if printf '%s' "$(gate_in "$xr2_sess" "$repo2" "$WORK")" | grep -q '"permissionDecision": *"deny"'; then
+run_gate "$xr2_sess" "$repo2" "$WORK"
+if [ "$GATE_RC" -eq 0 ] && printf '%s' "$GATE_OUT" | grep -q '"permissionDecision": *"deny"'; then
     ok "R4-1c: a commit in the second repo does not consume the first repo's state"
 else
-    bad "R4-1c: repo1 state leaked into repo2"
+    bad "R4-1c: repo1 state leaked into repo2 (rc=$GATE_RC)"
 fi
 rm -rf "$repo2" "$WORK/subpkg"
 
@@ -372,12 +537,70 @@ bad_tmp="$(mktemp -d)"
 ln -s /tmp "$bad_tmp/claude-harness-$(id -u)"
 r44_out="$(printf '{"hook_event_name":"PreToolUse","tool_name":"Bash","session_id":"smoke-r44","cwd":"%s","tool_input":{"command":"git commit -m x"}}' "$WORK" \
     | TMPDIR="$bad_tmp" CLAUDE_PROJECT_DIR="$WORK" python3 "$py_hook")"
-if printf '%s' "$r44_out" | grep -q '"permissionDecision": *"deny"'; then
+r44_rc=$?   # Codex ~L290: a crash here must fail, not read as "no deny -> allow"
+if [ "$r44_rc" -eq 0 ] && printf '%s' "$r44_out" | grep -q '"permissionDecision": *"deny"'; then
     ok "R4-4: insecure state dir -> gate denies (fail-closed)"
 else
-    bad "R4-4: gate should fail closed on an insecure state dir"
+    bad "R4-4: gate should fail closed on an insecure state dir (rc=$r44_rc)"
 fi
 rm -rf "$bad_tmp"
+
+# --- FX4: no-op-target anchoring. `make test-noop` shares the `make test` prefix
+#     but the approved-command anchor `(?=\s|$)` rejects the `-noop` suffix, so it
+#     records NO test evidence — with only a real lint on record the gate must DENY.
+noop_sess="smoke-$$-${RANDOM}-noop"
+record "$noop_sess" "make test-noop"   # must NOT count as a test (prefix only)
+record "$noop_sess" "make lint"        # a real lint IS recorded
+run_gate "$noop_sess" "$WORK" "$WORK"
+if [ "$GATE_RC" -eq 0 ] && printf '%s' "$GATE_OUT" | grep -q '"permissionDecision": *"deny"'; then
+    ok "FX4: 'make test-noop' is not recorded as a test; gate still denies"
+else
+    bad "FX4: 'make test-noop' was wrongly accepted as a test (rc=$GATE_RC)"
+fi
+
+# Positive control: the REAL targets do record and the gate approves.
+pos_sess="smoke-$$-${RANDOM}-pos"
+record "$pos_sess" "make test"
+record "$pos_sess" "make lint"
+run_gate "$pos_sess" "$WORK" "$WORK"
+if [ "$GATE_RC" -eq 0 ] && [ -z "$GATE_OUT" ]; then
+    ok "FX4: real 'make test' + 'make lint' -> gate approves"
+else
+    bad "FX4: expected allow after make test + make lint (rc=$GATE_RC)"
+fi
+
+# --- FX4: cross-repo retarget deny. Even with FRESH evidence for THIS repo, a
+#     commit whose effective target is a DIFFERENT repo (a `git -C <other>` flag,
+#     or a chained `cd <other> && git commit`) is denied BEFORE evidence is
+#     consulted, with the standalone-commit reason.
+retgt_sess="smoke-$$-${RANDOM}-retarget"
+record "$retgt_sess" "make test"
+record "$retgt_sess" "make lint"
+run_gate_cmd "$retgt_sess" "$WORK" "$WORK" "git -C /other/repo commit -m x"
+if [ "$GATE_RC" -eq 0 ] && printf '%s' "$GATE_OUT" | grep -q "standalone command from the repo root"; then
+    ok "FX4: 'git -C <other> commit' denied with the standalone-commit reason"
+else
+    bad "FX4: 'git -C <other> commit' retarget not denied (rc=$GATE_RC)"
+fi
+run_gate_cmd "$retgt_sess" "$WORK" "$WORK" "cd /other && git commit -m x"
+if [ "$GATE_RC" -eq 0 ] && printf '%s' "$GATE_OUT" | grep -q "standalone command from the repo root"; then
+    ok "FX4: 'cd <other> && git commit' denied with the standalone-commit reason"
+else
+    bad "FX4: chained-cd retarget not denied (rc=$GATE_RC)"
+fi
+
+# --- FX4: malformed gate event. A PreToolUse Bash event with `tool_input: null`
+#     (identifiably a commit-gate evaluation but unparseable) must emit an EXPLICIT
+#     deny (fail-closed) and never raise a traceback.
+malgate_out="$(printf '{"hook_event_name":"PreToolUse","tool_name":"Bash","session_id":"smoke-malformed-gate","cwd":"%s","tool_input":null}' "$WORK" \
+    | CLAUDE_PROJECT_DIR="$WORK" python3 "$py_hook" 2>&1)"
+malgate_rc=$?
+if [ "$malgate_rc" -eq 0 ] && printf '%s' "$malgate_out" | grep -q '"permissionDecision": *"deny"' \
+   && ! printf '%s' "$malgate_out" | grep -q "Traceback"; then
+    ok "FX4: malformed gate event (tool_input null) -> explicit deny, no traceback"
+else
+    bad "FX4: malformed gate event not denied cleanly (rc=$malgate_rc)"
+fi
 
 # --- Chaining (R3-4): a foreign hook is preserved (content+mode), the wrapper is
 #     marked, the installer exits 0, and a commit is blocked by the chained hook. ---
@@ -495,6 +718,30 @@ else
 fi
 rm -rf "$ext_repo" "$ext_hooks"
 
+# --- Containment (c) / FX5: a symlink-ESCAPE destination is REFUSED (fatal). A
+#     `.claude` symlink pointing OUTSIDE the repo would place harness files beyond
+#     the project root; assert_contained resolves the realpath BEFORE any mkdir,
+#     so the install exits nonzero with the containment message and writes ZERO
+#     files into the external target. Force direct mode so it is valid under either
+#     outer mode.
+se_repo="$(mktemp -d)"
+se_ext="$(mktemp -d)"          # external target OUTSIDE se_repo
+(
+    cd "$se_repo" || exit 1
+    git init -q && git config user.email a@b.c && git config user.name t
+    ln -s "$se_ext" .claude    # a symlinked ancestor that escapes the repo
+)
+se_out="$(cd "$se_repo" && HARNESS_KIT_HOOK_MODE=direct bash "$HARNESS_KIT/install.sh" 2>&1)"
+se_rc=$?
+se_snap="$(snapshot "$se_ext")"
+if [ "$se_rc" -ne 0 ] && printf '%s' "$se_out" | grep -q "resolves outside the project root" \
+   && [ -z "$se_snap" ]; then
+    ok "FX5: symlink-escape .claude refused (fatal); external target left empty"
+else
+    bad "FX5: symlink-escape not refused or external target written (rc=$se_rc)"
+fi
+rm -rf "$se_repo" "$se_ext"
+
 # --- R5-2: a marker-owned but NON-EXECUTABLE post-commit (a prior half-install, the
 #     reachable trigger for the old partial-install bug) is repaired within the
 #     transaction; the install succeeds and BOTH hooks end up active + executable. ---
@@ -515,6 +762,99 @@ else
     bad "R5-2: non-exec marker not repaired or install did not report success (rc=$nx_rc)"
 fi
 rm -rf "$nx"
+
+# --- Transactional rollback (QA gap: the mid-transaction _restore_hook path was
+#     never driven). Mechanism: plant a marker-owned but READ-ONLY (0400)
+#     post-commit. Its snapshot (cp -p) can READ it, and preflight passes, so the
+#     transaction proceeds and pre-commit is applied FIRST — then _apply_raw_hook
+#     post-commit tries to re-materialize the differing body by writing the 0400
+#     (non-writable) file, which FAILS. That post-apply failure drives
+#     `_restore_hook` for BOTH hooks. Assert: install exits nonzero, the rollback
+#     banner is printed, and pre-commit is restored to its pre-install state
+#     (ABSENT — `git init` creates no active pre-commit). Force direct mode.
+rb="$(mktemp -d)"
+(
+    cd "$rb" || exit 1
+    git init -q && git config user.email a@b.c && git config user.name t
+    printf '{"name":"demo"}\n' > package.json
+    git add -A && git commit -q --no-verify -m init
+    printf '#!/usr/bin/env bash\n# harness-kit hook\n' > .git/hooks/post-commit
+    chmod 0400 .git/hooks/post-commit
+)
+rb_out="$(cd "$rb" && HARNESS_KIT_HOOK_MODE=direct bash "$HARNESS_KIT/install.sh" 2>&1)"
+rb_rc=$?
+if [ "$rb_rc" -ne 0 ] && printf '%s' "$rb_out" | grep -q "rolling back BOTH hooks" \
+   && [ ! -e "$rb/.git/hooks/pre-commit" ]; then
+    ok "rollback: post-commit apply failure rolls back BOTH hooks; pre-commit restored to absent"
+else
+    bad "rollback: expected nonzero exit + rollback banner + pre-commit absent (rc=$rb_rc)"
+fi
+rm -rf "$rb"
+
+# --- FX5: a marker-OWNED but body-less (marker-only) post-commit is NOT trusted by
+#     its body — it is re-materialized byte-for-byte with the real hook body (not
+#     merely chmod'd), so the cleanup wiring is restored. Direct mode.
+mo="$(mktemp -d)"
+(
+    cd "$mo" || exit 1
+    git init -q && git config user.email a@b.c && git config user.name t
+    printf '{"name":"demo"}\n' > package.json
+    git add -A && git commit -q --no-verify -m init
+    printf '#!/usr/bin/env bash\n# harness-kit hook\n' > .git/hooks/post-commit
+    chmod +x .git/hooks/post-commit
+)
+( cd "$mo" && HARNESS_KIT_HOOK_MODE=direct bash "$HARNESS_KIT/install.sh" ) >/dev/null 2>&1
+mo_rc=$?
+if [ "$mo_rc" -eq 0 ] \
+   && grep -Fq '.harness/hooks/post-commit-cleanup.sh' "$mo/.git/hooks/post-commit" \
+   && [ -x "$mo/.git/hooks/post-commit" ]; then
+    ok "FX5: marker-only post-commit re-materialized with the cleanup body + executable"
+else
+    bad "FX5: marker-only post-commit not re-materialized (rc=$mo_rc)"
+fi
+rm -rf "$mo"
+
+# --- FX5: a .gitignore whose last line lacks a trailing newline must not have the
+#     harness entry merged onto the user's final pattern. Direct mode.
+gi="$(mktemp -d)"
+(
+    cd "$gi" || exit 1
+    git init -q && git config user.email a@b.c && git config user.name t
+    printf '{"name":"demo"}\n' > package.json
+    printf 'node_modules/' > .gitignore    # NO trailing newline
+    HARNESS_KIT_HOOK_MODE=direct bash "$HARNESS_KIT/install.sh" >/dev/null 2>&1
+)
+if grep -Fxq 'node_modules/' "$gi/.gitignore" && grep -Fxq '.harness-verified' "$gi/.gitignore"; then
+    ok "FX5: .gitignore without a trailing newline keeps .harness-verified on its own line"
+else
+    bad "FX5: .harness-verified was merged onto the prior .gitignore pattern"
+fi
+rm -rf "$gi"
+
+# --- Stamp deletion (QA gap: assert the post-commit cleanup actually DELETES the
+#     stamp, not merely that the commit succeeded). Fresh sub-repo, forced direct
+#     mode, full install + stamped project commit; the raw post-commit hook must
+#     remove .harness-verified end-to-end (complements Test C, which runs under the
+#     ambient outer mode in the main repo).
+sd="$(mktemp -d)"
+(
+    cd "$sd" || exit 1
+    git init -q && git config user.email a@b.c && git config user.name t
+    printf '{"name":"demo"}\n' > package.json
+    HARNESS_KIT_HOOK_MODE=direct bash "$HARNESS_KIT/install.sh" >/dev/null 2>&1
+    git add -A && git commit -q --no-verify -m init
+    printf 'console.log(1);\n' > app.js
+    git add app.js
+    touch .harness-verified
+)
+sd_rc=0
+( cd "$sd" && git commit -q -m "feat: stamped change" ) >/dev/null 2>&1 || sd_rc=$?
+if [ "$sd_rc" -eq 0 ] && [ ! -e "$sd/.harness-verified" ]; then
+    ok "stamp-deletion: post-commit cleanup deletes .harness-verified after a stamped commit"
+else
+    bad "stamp-deletion: stamp not deleted after a stamped commit (rc=$sd_rc)"
+fi
+rm -rf "$sd"
 
 # --- R6: a foreign .pre-commit-config.yaml -> installer exits 0, leaves the config
 #     untouched, and the banner truthfully reports hooks inactive. ---
