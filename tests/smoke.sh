@@ -248,6 +248,24 @@ else
 fi
 rm -rf "$nm_js"
 
+# (FR2) enumeration failure: no-mocks must ABORT (nonzero exit + the
+# enumeration-failure message), not silently scan an empty list, when its own
+# `git diff --cached --name-only` call fails. GIT_CEILING_DIRECTORIES pins repo
+# discovery to stop at this bare (never `git init`'d) fixture dir, so it does
+# NOT fall through to $WORK's own outer repo the way every other bare `mktemp -d`
+# fixture in this file benefits from (nested discovery finds the nearest .git) —
+# here that fallback is exactly what we must defeat to force the enumeration
+# call itself to fail.
+nm_noenum="$(mktemp -d)"
+nm_noenum_out="$(cd "$nm_noenum" && GIT_CEILING_DIRECTORIES="$nm_noenum" bash "$HARNESS_KIT/hooks/no-mocks.sh" 2>&1)"
+nm_noenum_rc=$?
+if [ "$nm_noenum_rc" -ne 0 ] && printf '%s' "$nm_noenum_out" | grep -q "failed to enumerate staged files"; then
+    ok "no-mocks: staged-file enumeration failure aborts (nonzero exit + message), not a silent no-op"
+else
+    bad "no-mocks: enumeration failure not handled (rc=$nm_noenum_rc)"
+fi
+rm -rf "$nm_noenum"
+
 # --- Test B: missing stamp blocks when a project marker exists ---
 printf '{"name":"demo"}\n' > package.json
 printf 'console.log("x");\n' > app.js
@@ -444,6 +462,20 @@ run_gate_cmd() { # session, cwd, projdir, command -> sets GATE_OUT + GATE_RC
 run_gate() {    # session, cwd, projdir -> gate the default `git commit -m x`
     run_gate_cmd "$1" "$2" "$3" "git commit -m x"
 }
+run_gate_quoted() { # session, cwd, projdir, command -> sets GATE_OUT + GATE_RC
+    # Like run_gate_cmd, but for a command containing EMBEDDED double quotes
+    # (a spaced `-C "..."` path, a `-m "release; cd notes"` message). printf-based
+    # JSON assembly (run_gate_cmd's approach) would corrupt on those quotes; build
+    # the JSON with python's json.dumps via a heredoc (argv, not shell interpolation)
+    # so the hook receives the literal command string, verified by construction.
+    GATE_OUT="$(python3 - "$1" "$2" "$4" <<'PY' | CLAUDE_PROJECT_DIR="$3" python3 "$py_hook"
+import json, sys
+session, cwd, command = sys.argv[1:4]
+print(json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Bash", "session_id": session, "cwd": cwd, "tool_input": {"command": command}}))
+PY
+)"
+    GATE_RC=$?   # pipefail -> the python exit status, not python-builder's
+}
 
 sess_unverified="smoke-$$-${RANDOM}-unverified"
 run_gate "$sess_unverified" "$WORK" "$WORK"
@@ -587,6 +619,41 @@ if [ "$GATE_RC" -eq 0 ] && printf '%s' "$GATE_OUT" | grep -q "standalone command
     ok "FX4: 'cd <other> && git commit' denied with the standalone-commit reason"
 else
     bad "FX4: chained-cd retarget not denied (rc=$GATE_RC)"
+fi
+
+# --- FR3: shlex-based retarget detection on commands with EMBEDDED quotes,
+#     which the old untokenized-regex gate mishandled in both directions.
+#     Fresh recorded evidence per scenario; run_gate_quoted builds the event
+#     JSON with python so the quotes reach the hook literally (printf-based
+#     JSON would corrupt on them). ---
+qc_sess="smoke-$$-${RANDOM}-quoted-C"
+record "$qc_sess" "make test"
+record "$qc_sess" "make lint"
+run_gate_quoted "$qc_sess" "$WORK" "$WORK" 'git -C "/other repo" commit -m x'
+if [ "$GATE_RC" -eq 0 ] && printf '%s' "$GATE_OUT" | grep -q "standalone command from the repo root"; then
+    ok "FR3: quoted 'git -C \"<spaced path>\" commit' denied with the standalone-commit reason"
+else
+    bad "FR3: quoted -C retarget not denied (rc=$GATE_RC)"
+fi
+
+qsub_sess="smoke-$$-${RANDOM}-subshell-cd"
+record "$qsub_sess" "make test"
+record "$qsub_sess" "make lint"
+run_gate_quoted "$qsub_sess" "$WORK" "$WORK" '(cd /other && git commit -m x)'
+if [ "$GATE_RC" -eq 0 ] && printf '%s' "$GATE_OUT" | grep -q "standalone command from the repo root"; then
+    ok "FR3: subshell '(cd /other && git commit)' denied with the standalone-commit reason"
+else
+    bad "FR3: subshell-cd retarget not denied (rc=$GATE_RC)"
+fi
+
+qmsg_sess="smoke-$$-${RANDOM}-cd-in-message"
+record "$qmsg_sess" "make test"
+record "$qmsg_sess" "make lint"
+run_gate_quoted "$qmsg_sess" "$WORK" "$WORK" 'git commit -m "release; cd notes"'
+if [ "$GATE_RC" -eq 0 ] && [ -z "$GATE_OUT" ]; then
+    ok "FR3: operators inside a quoted commit message do not trigger a false-positive deny"
+else
+    bad "FR3: 'cd notes' inside a quoted message was wrongly denied (rc=$GATE_RC, out=$GATE_OUT)"
 fi
 
 # --- FX4: malformed gate event. A PreToolUse Bash event with `tool_input: null`
@@ -741,6 +808,34 @@ else
     bad "FX5: symlink-escape not refused or external target written (rc=$se_rc)"
 fi
 rm -rf "$se_repo" "$se_ext"
+
+# --- Containment (d) / FR1: a symlinked LEAF destination is REFUSED (fatal),
+#     even when it is DANGLING. `docs/` is a real dir here (so assert_contained
+#     docs passes), but docs/golden-principles.md is a symlink to a path OUTSIDE
+#     the repo whose target does not exist — `[ -f ]` is false for a dangling
+#     symlink, so the old code fell into the "create" branch and wrote THROUGH
+#     it to the external target. refuse_symlink_leaf's `-L` test catches a
+#     symlink regardless of whether its target exists, so the install must now
+#     abort before ever writing. Force direct mode so it is valid under either
+#     outer mode.
+dl_repo="$(mktemp -d)"
+dl_ext="$(mktemp -d)"          # external target dir OUTSIDE dl_repo; symlink points here
+(
+    cd "$dl_repo" || exit 1
+    git init -q && git config user.email a@b.c && git config user.name t
+    mkdir -p docs
+    ln -s "$dl_ext/golden-principles.md" docs/golden-principles.md   # dangling: target absent
+)
+dl_out="$(cd "$dl_repo" && HARNESS_KIT_HOOK_MODE=direct bash "$HARNESS_KIT/install.sh" 2>&1)"
+dl_rc=$?
+dl_snap="$(snapshot "$dl_ext")"
+if [ "$dl_rc" -ne 0 ] && printf '%s' "$dl_out" | grep -q "is a symlink. Refusing to write through it" \
+   && [ -z "$dl_snap" ]; then
+    ok "FR1: dangling docs/golden-principles.md symlink refused; external target left empty"
+else
+    bad "FR1: docs-leaf symlink escape not refused or external target written (rc=$dl_rc)"
+fi
+rm -rf "$dl_repo" "$dl_ext"
 
 # --- R5-2: a marker-owned but NON-EXECUTABLE post-commit (a prior half-install, the
 #     reachable trigger for the old partial-install bug) is repaired within the
