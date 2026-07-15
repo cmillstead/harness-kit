@@ -11,3 +11,5 @@ __pycache__/
 # Internal planning + handoff docs (local-only, not distributed)
 docs/plans/
 docs/handoff/
+docs/retros/
+docs/project-evals.md
