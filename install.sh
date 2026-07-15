@@ -3,7 +3,7 @@
 #
 # Usage:
 #   cd /path/to/your/project
-#   ~/src/harness-kit/install.sh
+#   /path/to/harness-kit/install.sh
 #
 # What it does (numbered to match the sections in the body below):
 #   1.  Copies AGENTS.md (if not present) or warns if one exists
