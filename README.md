@@ -9,13 +9,15 @@ Based on *The Harness Engineering Playbook* (Cevin Millstead, 2026).
 ## Install
 
 ```bash
-# 1. Clone the kit somewhere stable
-git clone https://github.com/cmillstead/harness-kit.git /path/to/harness-kit
+# 1. Clone the kit somewhere stable, pinned to a release tag (not mutable main)
+git clone --branch v0.1.0 https://github.com/cmillstead/harness-kit.git /path/to/harness-kit
 
 # 2. From your project root, run the installer
 cd /path/to/your/project
 /path/to/harness-kit/install.sh
 ```
+
+> **Heads-up — `install.sh` wires executable git hooks.** It installs a `pre-commit` hook that blocks unverified commits and a `post-commit` cleanup hook, and appends a `.harness-verified` line to your `.gitignore`. It is additive — any hook you already have is preserved and chained, nothing is overwritten — but the hooks run on every commit, so skim [What It Creates](#what-it-creates) and [Uninstall](#uninstall) before running it in a repo you care about. The kit is **pre-1.0** while the companion book is being finalized; pin to a release tag (as above) rather than tracking `main`, which may shift.
 
 ## What It Creates
 
