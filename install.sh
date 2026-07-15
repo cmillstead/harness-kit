@@ -2,6 +2,9 @@
 # Install the universal harness into a project.
 #
 # Usage:
+#   /path/to/harness-kit/install.sh --user
+#   cd /path/to/your/project
+#   /path/to/harness-kit/install.sh --drift
 #   cd /path/to/your/project
 #   /path/to/harness-kit/install.sh
 #
@@ -22,6 +25,35 @@
 
 set -euo pipefail
 
+usage() {
+    cat <<'EOF'
+Usage:
+  install.sh                Install the project tier into the current git repository.
+  install.sh --user         Install personal operator-tier instructions.
+  install.sh --drift        Report project-tier drift from the current kit.
+  install.sh -h|--help      Show this help.
+EOF
+}
+
+MODE="project"
+if [ "$#" -gt 1 ]; then
+    echo "ERROR: --user and --drift are standalone modes; provide only one option." >&2
+    usage >&2
+    exit 2
+elif [ "$#" -eq 1 ]; then
+    case "$1" in
+        --user) MODE="user" ;;
+        --drift) MODE="drift" ;;
+        -h|--help)
+            usage
+            exit 0 ;;
+        *)
+            echo "ERROR: unknown option: $1" >&2
+            usage >&2
+            exit 2 ;;
+    esac
+fi
+
 # python3 is a hard dependency (path canonicalization below + worktree detection).
 # Under `set -e` a missing python3 would otherwise die mid-run with a bare "command
 # not found" AFTER some files were copied; fail fast with a clear message first.
@@ -38,10 +70,52 @@ _realpath() { python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' 
 # HARNESS_KIT to the real kit dir. This both fixes symlinked invocation generally
 # and closes a bypass of the self-install guard below.
 HARNESS_KIT="$(cd "$(dirname "$(_realpath "$0")")" && pwd)"
+
+refuse_symlink_leaf() {
+    # A pre-existing symlink leaf could follow outside the intended destination;
+    # a symlink to a nonexistent target even passes `[ -f ]` as false and would
+    # be written THROUGH. Refuse it before any copy.
+    local dest="$1"
+    if [ -L "$dest" ]; then
+        echo "ERROR: $dest is a symlink. Refusing to write through it (it may escape the repo)." >&2
+        exit 1
+    fi
+}
+
+install_user_tier() {
+    local template="$HARNESS_KIT/templates/user-tier.md"
+    local dest parent
+    local destinations=("$HOME/.claude/CLAUDE.md" "$HOME/.codex/AGENTS.md")
+
+    for dest in "${destinations[@]}"; do
+        parent="$(dirname "$dest")"
+        mkdir -p "$parent"
+        refuse_symlink_leaf "$dest"
+        if [ -e "$dest" ]; then
+            echo "⟳ $dest already exists — skipping (template: $template — merge by hand if wanted)"
+        else
+            cp "$template" "$dest"
+            echo "✓ Created $dest"
+        fi
+    done
+
+    echo ""
+    echo "Operator tier installed: personal cross-project instructions only; no hooks or executables."
+    echo "Project-tier repo installs are unaffected and override these defaults on conflict."
+    echo "Edit the installed files to match how you work."
+}
+
+if [ "$MODE" = "user" ]; then
+    install_user_tier
+    exit 0
+fi
+
 PROJECT_ROOT="$(pwd)"
 
-echo "Installing harness into: $PROJECT_ROOT"
-echo ""
+if [ "$MODE" = "project" ]; then
+    echo "Installing harness into: $PROJECT_ROOT"
+    echo ""
+fi
 
 # Require running from the git top-level (works with worktrees, where .git is a file).
 TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null || true)"
@@ -67,6 +141,90 @@ if [ "$PROJECT_ROOT" -ef "$HARNESS_KIT" ]; then
     exit 1
 fi
 
+run_drift_report() {
+    local identical=0 differs=0 missing=0 generated=0
+    local index destination source state
+    local destinations=(
+        "AGENTS.md"
+        "docs/golden-principles.md"
+        "docs/harness-philosophy.md"
+        "docs/code-style.md"
+        "docs/decision-record-template.md"
+        "docs/eval-template.md"
+        "docs/escape-hatch-audit.md"
+        "docs/context-inheritance-audit.md"
+        ".harness/hooks/no-mocks.sh"
+        ".harness/hooks/pre-commit-verify.sh"
+        ".harness/hooks/post-commit-cleanup.sh"
+        ".pre-commit-config.yaml"
+        "skills/review.md"
+        ".claude/hooks/stop-verify.sh"
+        ".claude/hooks/pre-completion-checklist.py"
+        ".claude/hooks/settings-snippet.json"
+    )
+    local sources=(
+        "$HARNESS_KIT/AGENTS.md"
+        "$HARNESS_KIT/docs/golden-principles.md"
+        "$HARNESS_KIT/docs/harness-philosophy.md"
+        "$HARNESS_KIT/docs/code-style.md"
+        "$HARNESS_KIT/docs/decision-record-template.md"
+        "$HARNESS_KIT/docs/eval-template.md"
+        "$HARNESS_KIT/docs/escape-hatch-audit.md"
+        "$HARNESS_KIT/docs/context-inheritance-audit.md"
+        "$HARNESS_KIT/hooks/no-mocks.sh"
+        "$HARNESS_KIT/hooks/pre-commit-verify.sh"
+        "$HARNESS_KIT/hooks/post-commit-cleanup.sh"
+        "$HARNESS_KIT/.pre-commit-config.yaml"
+        "$HARNESS_KIT/skills/review.md"
+        "$HARNESS_KIT/hooks/stop-verify.sh"
+        "$HARNESS_KIT/hooks/pre-completion-checklist.py"
+        "$HARNESS_KIT/hooks/settings-snippet.json"
+    )
+    local generated_files=(
+        "CLAUDE.md"
+        ".cursor/rules/harness.md"
+        ".claude/skills/review/SKILL.md"
+    )
+
+    echo "Harness drift report: $PROJECT_ROOT"
+    for ((index = 0; index < ${#destinations[@]}; index++)); do
+        destination="${destinations[$index]}"
+        source="${sources[$index]}"
+        if [ ! -e "$destination" ]; then
+            state="missing"
+            missing=$((missing + 1))
+        elif cmp -s "$destination" "$source"; then
+            state="identical"
+            identical=$((identical + 1))
+        else
+            state="differs from kit"
+            differs=$((differs + 1))
+        fi
+        printf '  %-48s %s\n' "$destination" "$state"
+    done
+
+    for destination in "${generated_files[@]}"; do
+        printf '  %-48s %s\n' "$destination" "generated — not compared"
+        generated=$((generated + 1))
+    done
+
+    echo "Summary: $identical identical, $differs differs, $missing missing, $generated generated — not compared"
+    echo '"differs" may be YOUR intentional customization or a kit update you have not pulled — diff it and decide; --drift never modifies anything.'
+
+    if [ "$differs" -eq 0 ] && [ "$missing" -eq 0 ]; then
+        return 0
+    fi
+    return 1
+}
+
+if [ "$MODE" = "drift" ]; then
+    if run_drift_report; then
+        exit 0
+    else
+        exit $?
+    fi
+fi
+
 # Canonical project root for the symlink-escape containment guard.
 PROJECT_REAL="$(_realpath "$PROJECT_ROOT")"
 
@@ -82,17 +240,6 @@ assert_contained() {
            echo "       A symlinked directory would place harness files outside your repo. Refusing." >&2
            exit 1 ;;
     esac
-}
-
-refuse_symlink_leaf() {
-    # Leaf companion to assert_contained (which guards ancestor dirs). A pre-existing
-    # symlink leaf could follow out of the repo; a symlink to a nonexistent target
-    # even passes `[ -f ]` as false and would be written THROUGH. Refuse it. Fatal.
-    local dest="$1"
-    if [ -L "$dest" ]; then
-        echo "ERROR: $dest is a symlink. Refusing to write through it (it may escape the repo)." >&2
-        exit 1
-    fi
 }
 
 # Internal/testing seam (R2-R5): force the hook-install path deterministically.
@@ -598,6 +745,7 @@ echo "Next steps:"
 echo "  1. Edit AGENTS.md — fill in the placeholder sections"
 echo "  2. Commit: git add AGENTS.md CLAUDE.md docs/ .harness/ .pre-commit-config.yaml"
 echo "  3. Test: touch .harness-verified && git commit -m 'test: harness install'"
+echo "  4. Optional: install personal cross-project defaults: /path/to/harness-kit/install.sh --user"
 echo ""
 echo "Claude Code users — enable the dynamic hooks:"
 echo "  Merge .claude/hooks/settings-snippet.json into .claude/settings.json"
