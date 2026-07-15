@@ -7,3 +7,7 @@ __pycache__/
 
 # Harness verification stamp (single-use, never committed)
 .harness-verified
+
+# Internal planning + handoff docs (local-only, not distributed)
+docs/plans/
+docs/handoff/
