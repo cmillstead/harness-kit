@@ -39,6 +39,19 @@ if [ ! "$TOPLEVEL" -ef "$PROJECT_ROOT" ]; then
     exit 1
 fi
 
+# Refuse to install the kit into itself. With cwd set to the harness-kit checkout,
+# install.sh would "install the kit into the kit": wire THIS clone's raw git hooks
+# and scatter CLAUDE.md/.claude/.cursor/.harness across the source tree, behind a
+# stream of nonsensical "already exists" skips. -ef compares filesystem identity
+# (same inode), so symlinked checkouts and macOS /var -> /private/var aliases are
+# handled — same idiom as the toplevel check above.
+if [ "$PROJECT_ROOT" -ef "$HARNESS_KIT" ]; then
+    printf 'ERROR: you are running install.sh from inside the harness-kit checkout itself.\n' >&2
+    printf '       Run it from the project you want to install INTO, e.g.:\n' >&2
+    printf '         cd /path/to/your/project && "%s/install.sh"\n' "$HARNESS_KIT" >&2
+    exit 1
+fi
+
 # python3 is a hard dependency (path canonicalization below + worktree detection).
 # Under `set -e` a missing python3 would otherwise die mid-run with a bare "command
 # not found" AFTER some files were copied; fail fast with a clear message first.

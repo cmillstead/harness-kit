@@ -163,6 +163,47 @@ else
     bad "idempotency: second install did not exit 0"
 fi
 
+# --- F1: self-install guard. Running install.sh with cwd == the directory that
+#     CONTAINS it (the harness-kit checkout itself) must be REFUSED — exit 1 with a
+#     clear message, BEFORE any mutation. The fixture only needs the install.sh
+#     UNDER TEST placed at a fresh repo root and invoked from that root; assert the
+#     refusal AND — via the suite's snapshot() idiom — that NOTHING in the fixture
+#     changed (content, modes, or .git/hooks).
+si_kit="$(mktemp -d)"
+cp "$HARNESS_KIT/install.sh" "$si_kit/install.sh"
+(
+    cd "$si_kit" || exit 1
+    git init -q && git config user.email a@b.c && git config user.name t
+)
+si_before="$(snapshot "$si_kit")"
+si_out="$(cd "$si_kit" && HARNESS_KIT_HOOK_MODE=direct bash "$si_kit/install.sh" 2>&1)"
+si_rc=$?
+si_after="$(snapshot "$si_kit")"
+if [ "$si_rc" -eq 1 ] && printf '%s' "$si_out" | grep -q "from inside the harness-kit checkout" \
+   && [ "$si_before" = "$si_after" ]; then
+    ok "F1: self-install (cwd == install.sh's own dir) refused (exit 1); zero mutation (snapshot-identical)"
+else
+    bad "F1: self-install guard did not fire or mutated the fixture (rc=$si_rc)"
+fi
+
+# --- F1b: same refusal when cwd uses the REAL path but $0 travels through a
+#     SYMLINK alias — the two spellings DIFFER while naming the same directory,
+#     so only an identity-aware (-ef) comparison passes; a plain string-equality
+#     guard would miss it.
+si_link="$TMPDIR/si-link-$$"
+ln -s "$si_kit" "$si_link"
+sl_out="$(cd "$si_kit" && HARNESS_KIT_HOOK_MODE=direct bash "$si_link/install.sh" 2>&1)"
+sl_rc=$?
+sl_after="$(snapshot "$si_kit")"
+if [ "$sl_rc" -eq 1 ] && printf '%s' "$sl_out" | grep -q "from inside the harness-kit checkout" \
+   && [ "$si_before" = "$sl_after" ]; then
+    ok "F1b: self-install via a symlinked kit dir refused (exit 1); zero mutation"
+else
+    bad "F1b: symlinked self-install not refused or mutated the fixture (rc=$sl_rc)"
+fi
+rm -f "$si_link"
+rm -rf "$si_kit"
+
 # --- CLAUDE.md pre-existing message-only behavior (installer step 6). Each
 #     fixture is a standalone sandbox repo (mktemp -d + git init), not $WORK, so
 #     it does not disturb the completeness/idempotency state above. ---
