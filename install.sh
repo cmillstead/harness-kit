@@ -3,7 +3,7 @@
 #
 # Usage:
 #   cd /path/to/your/project
-#   ~/src/harness-kit/install.sh
+#   /path/to/harness-kit/install.sh
 #
 # What it does (numbered to match the sections in the body below):
 #   1.  Copies AGENTS.md (if not present) or warns if one exists
@@ -22,7 +22,22 @@
 
 set -euo pipefail
 
-HARNESS_KIT="$(cd "$(dirname "$0")" && pwd)"
+# python3 is a hard dependency (path canonicalization below + worktree detection).
+# Under `set -e` a missing python3 would otherwise die mid-run with a bare "command
+# not found" AFTER some files were copied; fail fast with a clear message first.
+command -v python3 >/dev/null 2>&1 || { echo "ERROR: install.sh requires python3 (used for path canonicalization and worktree detection). Install python3 and re-run." >&2; exit 1; }
+
+# _realpath: canonical absolute path (resolves symlinks in the existing prefix).
+# Defined before HARNESS_KIT so $0 can be resolved through a leaf symlink, and
+# reused by the containment guards below AND the hook-path checks later.
+# Needs only python3 (verified above).
+_realpath() { python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+
+# $0 is realpath-resolved before taking its dirname, so a leaf-symlinked install.sh
+# (e.g. ~/bin/install-harness -> .../harness-kit/install.sh) still resolves
+# HARNESS_KIT to the real kit dir. This both fixes symlinked invocation generally
+# and closes a bypass of the self-install guard below.
+HARNESS_KIT="$(cd "$(dirname "$(_realpath "$0")")" && pwd)"
 PROJECT_ROOT="$(pwd)"
 
 echo "Installing harness into: $PROJECT_ROOT"
@@ -39,15 +54,18 @@ if [ ! "$TOPLEVEL" -ef "$PROJECT_ROOT" ]; then
     exit 1
 fi
 
-# python3 is a hard dependency (path canonicalization below + worktree detection).
-# Under `set -e` a missing python3 would otherwise die mid-run with a bare "command
-# not found" AFTER some files were copied; fail fast with a clear message first.
-command -v python3 >/dev/null 2>&1 || { echo "ERROR: install.sh requires python3 (used for path canonicalization and worktree detection). Install python3 and re-run." >&2; exit 1; }
-
-# _realpath: canonical absolute path (resolves symlinks in the existing prefix).
-# Defined at the top so the containment guards below AND the hook-path checks later
-# both use it. Needs only python3 (verified above).
-_realpath() { python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+# Refuse to install the kit into itself. With cwd set to the harness-kit checkout,
+# install.sh would "install the kit into the kit": wire THIS clone's raw git hooks
+# and scatter CLAUDE.md/.claude/.cursor/.harness across the source tree, behind a
+# stream of nonsensical "already exists" skips. -ef compares filesystem identity
+# (same inode), so symlinked checkouts and macOS /var -> /private/var aliases are
+# handled — same idiom as the toplevel check above.
+if [ "$PROJECT_ROOT" -ef "$HARNESS_KIT" ]; then
+    printf 'ERROR: you are running install.sh from inside the harness-kit checkout itself.\n' >&2
+    printf '       Run it from the project you want to install INTO, e.g.:\n' >&2
+    printf '         cd /path/to/your/project && /path/to/harness-kit/install.sh\n' >&2
+    exit 1
+fi
 
 # Canonical project root for the symlink-escape containment guard.
 PROJECT_REAL="$(_realpath "$PROJECT_ROOT")"

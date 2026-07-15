@@ -10,11 +10,11 @@ Based on *The Harness Engineering Playbook* (Cevin Millstead, 2026).
 
 ```bash
 # 1. Clone the kit somewhere stable
-git clone https://github.com/cmillstead/harness-kit.git ~/src/harness-kit
+git clone https://github.com/cmillstead/harness-kit.git /path/to/harness-kit
 
 # 2. From your project root, run the installer
 cd /path/to/your/project
-~/src/harness-kit/install.sh
+/path/to/harness-kit/install.sh
 ```
 
 ## What It Creates
