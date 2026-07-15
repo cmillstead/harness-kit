@@ -201,6 +201,25 @@ if [ "$sl_rc" -eq 1 ] && printf '%s' "$sl_out" | grep -q "from inside the harnes
 else
     bad "F1b: symlinked self-install not refused or mutated the fixture (rc=$sl_rc)"
 fi
+
+# --- F1c: leaf-symlink bypass (harden round 1): symlink ONLY the script file
+#     outside the checkout and invoke it with cwd == the checkout. dirname($0)
+#     is then the symlink's dir, so an UNRESOLVED $0 would defeat the guard;
+#     install.sh realpath-resolves $0 before dirname, so the guard must still
+#     fire and mutate nothing.
+si_leaf="$TMPDIR/si-leaf-$$"
+mkdir -p "$si_leaf"
+ln -s "$si_kit/install.sh" "$si_leaf/install-harness"
+lf_out="$(cd "$si_kit" && HARNESS_KIT_HOOK_MODE=direct bash "$si_leaf/install-harness" 2>&1)"
+lf_rc=$?
+lf_after="$(snapshot "$si_kit")"
+if [ "$lf_rc" -eq 1 ] && printf '%s' "$lf_out" | grep -q "from inside the harness-kit checkout" \
+   && [ "$si_before" = "$lf_after" ]; then
+    ok "F1c: leaf-symlinked install.sh invoked with cwd == checkout still refused; zero mutation"
+else
+    bad "F1c: leaf-symlink bypass — guard did not fire (rc=$lf_rc)"
+fi
+rm -rf "$si_leaf"
 rm -f "$si_link"
 rm -rf "$si_kit"
 
