@@ -1195,5 +1195,130 @@ else
 fi
 rm -rf "$pc"
 
+# --- --user: operator-tier install works outside git, is non-overwriting, and
+#     never writes into the directory from which it is invoked. ---
+user_home="$WORK/user-home"
+user_nongit="$WORK/user-nongit"
+mkdir -p "$user_home" "$user_nongit"
+user_out="$(cd "$user_nongit" && GIT_CEILING_DIRECTORIES="$WORK" HOME="$user_home" \
+    bash "$HARNESS_KIT/install.sh" --user 2>&1)"
+user_rc=$?
+if [ "$user_rc" -eq 0 ] \
+   && printf '%s' "$user_out" | grep -Fq "✓ Created $user_home/.claude/CLAUDE.md" \
+   && printf '%s' "$user_out" | grep -Fq "✓ Created $user_home/.codex/AGENTS.md" \
+   && grep -Fq "Operator Harness — User Tier" "$user_home/.claude/CLAUDE.md" \
+   && grep -Fq "Operator Harness — User Tier" "$user_home/.codex/AGENTS.md"; then
+    ok "--user: non-git install creates both operator-tier instruction files"
+else
+    bad "--user: expected exit 0, both Created messages, and both operator-tier files (rc=$user_rc)"
+fi
+
+printf '\n# user-tier-sentinel\n' >> "$user_home/.claude/CLAUDE.md"
+user_mutated_checksum="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$user_home/.claude/CLAUDE.md")"
+user_rerun_out="$(cd "$user_nongit" && GIT_CEILING_DIRECTORIES="$WORK" HOME="$user_home" \
+    bash "$HARNESS_KIT/install.sh" --user 2>&1)"
+user_rerun_rc=$?
+user_after_checksum="$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$user_home/.claude/CLAUDE.md")"
+if [ "$user_rerun_rc" -eq 0 ] \
+   && printf '%s' "$user_rerun_out" | grep -Fq "$user_home/.claude/CLAUDE.md already exists — skipping" \
+   && [ "$user_mutated_checksum" = "$user_after_checksum" ] \
+   && grep -Fq '# user-tier-sentinel' "$user_home/.claude/CLAUDE.md"; then
+    ok "--user: existing file is skipped and remains byte-for-byte unchanged"
+else
+    bad "--user: expected exit 0, skipping message, and unchanged sentinel file (rc=$user_rerun_rc)"
+fi
+
+user_empty_home="$WORK/user-empty-home"
+user_empty_cwd="$WORK/user-empty-cwd"
+mkdir -p "$user_empty_home" "$user_empty_cwd"
+user_cwd_out="$(cd "$user_empty_cwd" && GIT_CEILING_DIRECTORIES="$WORK" HOME="$user_empty_home" \
+    bash "$HARNESS_KIT/install.sh" --user 2>&1)"
+user_cwd_rc=$?
+user_cwd_entry="$(find "$user_empty_cwd" -mindepth 1 -print -quit)"
+if [ "$user_cwd_rc" -eq 0 ] \
+   && printf '%s' "$user_cwd_out" | grep -Fq "Operator tier installed" \
+   && [ -z "$user_cwd_entry" ]; then
+    ok "--user: invocation leaves a fresh working directory empty"
+else
+    bad "--user: expected exit 0, summary message, and no cwd writes (rc=$user_cwd_rc)"
+fi
+
+# --- --drift: clean/different/missing states, exit codes, and read-only proof. ---
+drift_repo="$WORK/drift-repo"
+mkdir -p "$drift_repo"
+(
+    cd "$drift_repo" || exit 1
+    git init -q && git config user.email a@b.c && git config user.name t
+    HARNESS_KIT_HOOK_MODE=direct bash "$HARNESS_KIT/install.sh" >/dev/null 2>&1
+)
+drift_clean_out="$(cd "$drift_repo" && bash "$HARNESS_KIT/install.sh" --drift 2>&1)"
+drift_clean_rc=$?
+drift_clean_differences="$(printf '%s\n' "$drift_clean_out" | grep -c 'differs from kit$' || true)"
+if [ "$drift_clean_rc" -eq 0 ] \
+   && printf '%s' "$drift_clean_out" | grep -Fq "identical" \
+   && printf '%s' "$drift_clean_out" | grep -Fq "Summary: 16 identical, 0 differs, 0 missing" \
+   && [ "$drift_clean_differences" -eq 0 ]; then
+    ok "--drift: fresh default install reports clean and exits 0"
+else
+    bad "--drift: expected exit 0, identical state, and zero differs (rc=$drift_clean_rc)"
+fi
+
+printf '\n# intentional drift fixture\n' >> "$drift_repo/docs/golden-principles.md"
+drift_diff_out="$(cd "$drift_repo" && bash "$HARNESS_KIT/install.sh" --drift 2>&1)"
+drift_diff_rc=$?
+drift_diff_count="$(printf '%s\n' "$drift_diff_out" | grep -c 'differs from kit$' || true)"
+if [ "$drift_diff_rc" -eq 1 ] \
+   && printf '%s' "$drift_diff_out" | grep -E -q 'docs/golden-principles\.md +differs from kit$' \
+   && [ "$drift_diff_count" -eq 1 ]; then
+    ok "--drift: changed golden principles is the sole differs-from-kit file"
+else
+    bad "--drift: expected exit 1 and exactly golden-principles.md differs (rc=$drift_diff_rc)"
+fi
+
+cp "$HARNESS_KIT/docs/golden-principles.md" "$drift_repo/docs/golden-principles.md"
+rm "$drift_repo/skills/review.md"
+drift_missing_out="$(cd "$drift_repo" && bash "$HARNESS_KIT/install.sh" --drift 2>&1)"
+drift_missing_rc=$?
+drift_missing_count="$(printf '%s\n' "$drift_missing_out" | grep -c 'missing$' || true)"
+if [ "$drift_missing_rc" -eq 1 ] \
+   && printf '%s' "$drift_missing_out" | grep -E -q 'skills/review\.md +missing$' \
+   && [ "$drift_missing_count" -eq 1 ]; then
+    ok "--drift: deleted review skill is the sole missing file"
+else
+    bad "--drift: expected exit 1 and exactly skills/review.md missing (rc=$drift_missing_rc)"
+fi
+
+drift_before="$(snapshot "$drift_repo")"
+drift_readonly_out="$(cd "$drift_repo" && bash "$HARNESS_KIT/install.sh" --drift 2>&1)"
+drift_readonly_rc=$?
+drift_after="$(snapshot "$drift_repo")"
+if [ "$drift_readonly_rc" -eq 1 ] \
+   && printf '%s' "$drift_readonly_out" | grep -Fq -- "--drift never modifies anything" \
+   && [ "$drift_before" = "$drift_after" ]; then
+    ok "--drift: report mode leaves the repository tree byte-for-byte unchanged"
+else
+    bad "--drift: expected exit 1, read-only legend, and identical tree snapshots (rc=$drift_readonly_rc)"
+fi
+
+# --- flags: unknown and combined options are usage errors (exit 2 + message). ---
+bogus_stdout="$WORK/bogus.stdout"
+bogus_stderr="$WORK/bogus.stderr"
+bash "$HARNESS_KIT/install.sh" --bogus >"$bogus_stdout" 2>"$bogus_stderr"
+bogus_rc=$?
+if [ "$bogus_rc" -eq 2 ] && grep -Fq "Usage:" "$bogus_stderr" \
+   && grep -Fq "unknown option: --bogus" "$bogus_stderr"; then
+    ok "flags: unknown option exits 2 and prints usage on stderr"
+else
+    bad "flags: --bogus expected exit 2 plus error and usage on stderr (rc=$bogus_rc)"
+fi
+
+combined_out="$(bash "$HARNESS_KIT/install.sh" --user --drift 2>&1)"
+combined_rc=$?
+if [ "$combined_rc" -eq 2 ] && printf '%s' "$combined_out" | grep -Fq "standalone modes"; then
+    ok "flags: combined --user --drift exits 2 with standalone-mode error"
+else
+    bad "flags: combined modes expected exit 2 plus standalone-mode message (rc=$combined_rc)"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

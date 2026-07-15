@@ -6,15 +6,32 @@ Universal harness for AI-assisted development. Works with any coding agent — C
 
 Based on *The Harness Engineering Playbook* (Cevin Millstead, 2026).
 
+## Two Tiers
+
+A harness has two tiers. This kit's default install lays down the **project
+tier** — the part that lives in your repo, is committed to git, binds everyone
+(and every agent) working on that project, and enforces via git hooks. The
+**operator tier** — your personal, cross-project defaults (a global
+instruction file in your agent's home directory, e.g. `~/.claude/CLAUDE.md`
+for Claude Code or `~/.codex/AGENTS.md` for Codex) — is per-person and
+per-agent, so it is not part of the repo install. `install.sh --user` lays
+down a minimal operator-tier starter (instructions only — no hooks, nothing
+executable). The project tier is the primary product: it is the shareable,
+enforceable, agent-agnostic part. On conflict, project tier wins.
+
 ## Install
 
 ```bash
 # 1. Clone the kit somewhere stable, pinned to a release tag (not mutable main)
 git clone --branch v0.1.0 https://github.com/cmillstead/harness-kit.git /path/to/harness-kit
 
-# 2. From your project root, run the installer
+# 2. From your project root, install the project tier (default)
 cd /path/to/your/project
 /path/to/harness-kit/install.sh
+
+# Other modes (each flag is standalone)
+/path/to/harness-kit/install.sh --user   # Personal operator tier; may run anywhere
+/path/to/harness-kit/install.sh --drift  # Read-only project-tier comparison; run at repo root
 ```
 
 > **Heads-up — `install.sh` wires executable git hooks.** It installs a `pre-commit` hook that blocks unverified commits and a `post-commit` cleanup hook, and appends a `.harness-verified` line to your `.gitignore`. It is additive — any hook you already have is preserved and chained, nothing is overwritten — but the hooks run on every commit, so skim [What It Creates](#what-it-creates) and [Uninstall](#uninstall) before running it in a repo you care about. The kit is **pre-1.0** while the companion book is being finalized; pin to a release tag (as above) rather than tracking `main`, which may shift.
@@ -75,6 +92,36 @@ git commit -m "feat: your change"
 ```
 
 Docs-only repos (no `package.json`, `Cargo.toml`, etc.) skip verification automatically.
+
+## Operator Tier (install.sh --user)
+
+Run the operator-tier install from anywhere; no git repository is required:
+
+```bash
+/path/to/harness-kit/install.sh --user
+```
+
+It writes the same minimal instruction template to `~/.claude/CLAUDE.md` and
+`~/.codex/AGENTS.md`. It never overwrites an existing file: existing operator
+instructions are skipped for you to merge by hand if wanted. This tier contains
+instructions only — no hooks or executables. Project-tier instructions in each
+repository extend and override these personal defaults.
+
+## Checking for Drift (install.sh --drift)
+
+From an installed project repository root, compare every byte-copied harness file
+with the current canonical copy in the kit:
+
+```bash
+/path/to/harness-kit/install.sh --drift
+```
+
+Each file is reported as `identical`, `differs from kit`, or `missing`; generated
+wrapper files are reported as `generated — not compared`. The command exits 0 when
+all compared files are identical, 1 when any file differs or is missing, and 2 for
+usage errors, so CI can use its exit code. Drift mode is strictly read-only. An
+intentional per-repo customization is fine — that is what these files are for —
+while this mode surfaces unnoticed divergence so you can diff it and decide.
 
 ## What's Inside
 
